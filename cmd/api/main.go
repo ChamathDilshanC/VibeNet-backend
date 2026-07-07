@@ -1,17 +1,24 @@
 // Package main is the entry point for the VibeNet API server.
-// It initializes database connections and prepares the runtime for future
-// HTTP and WebSocket handlers.
+// It wires database connections, REST routes, and the WebSocket hub.
 package main
 
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/api"
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/auth"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/websocket"
+	"github.com/ChamathDilshanC/VibeNet-backend/pkg/utils"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
 )
 
@@ -48,11 +55,61 @@ func main() {
 		log.Println("dynamodb connection established")
 	}
 
-	log.Println("vibenet backend baseline ready")
+	postgresRepo := db.NewPostgresRepo(postgresDB)
+	dynamoRepo := db.NewDynamoRepo(dynamoClient, db.MessagesTableName(dynamoCfg))
+	jwtManager := auth.NewJWTManager()
+	googleCfg := auth.LoadGoogleOAuthConfig()
+
+	apiHandler := api.NewHandler(postgresRepo, jwtManager, googleCfg)
+	wsHub := websocket.NewHub()
+	wsHandler := websocket.NewHandler(wsHub, apiHandler, dynamoRepo)
+
+	router := chi.NewRouter()
+	router.Use(middleware.RequestID)
+	router.Use(middleware.RealIP)
+	router.Use(middleware.Logger)
+	router.Use(middleware.Recoverer)
+	router.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{utils.GetEnv("CORS_ALLOWED_ORIGINS", "*")},
+		AllowedMethods:   []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodOptions},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:           300,
+	}))
+
+	router.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	apiHandler.RegisterRoutes(router)
+	router.Get("/ws", wsHandler.ServeHTTP)
+
+	port := utils.GetEnv("APP_PORT", "8080")
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      router,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("vibenet backend listening on :%s", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
 
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 	<-shutdown
 
 	log.Println("shutting down gracefully")
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("server shutdown error: %v", err)
+	}
 }

@@ -4,11 +4,15 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
 	"github.com/ChamathDilshanC/VibeNet-backend/pkg/utils"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
 // DynamoDBConfig holds the connection parameters for the Amazon DynamoDB messages table.
@@ -16,6 +20,12 @@ type DynamoDBConfig struct {
 	Region    string
 	TableName string
 	Endpoint  string
+}
+
+// DynamoRepo wraps a DynamoDB client with encrypted message persistence methods.
+type DynamoRepo struct {
+	client    *dynamodb.Client
+	tableName string
 }
 
 // LoadDynamoDBConfig builds a DynamoDBConfig from environment variables.
@@ -45,6 +55,77 @@ func ConnectDynamoDB(ctx context.Context, cfg DynamoDBConfig) (*dynamodb.Client,
 	}
 
 	return client, nil
+}
+
+// NewDynamoRepo returns a repository backed by the provided DynamoDB client.
+func NewDynamoRepo(client *dynamodb.Client, tableName string) *DynamoRepo {
+	return &DynamoRepo{client: client, tableName: tableName}
+}
+
+// SaveMessage persists an encrypted chat message. Only ciphertext and cryptographic
+// metadata are stored; the backend never handles plain-text content.
+func (r *DynamoRepo) SaveMessage(
+	ctx context.Context,
+	messageID, chatRoomID, senderID, ciphertext, nonce string,
+	timestamp int64,
+) error {
+	message := models.Message{
+		ChatRoomID: chatRoomID,
+		Timestamp:  timestamp,
+		MessageID:  messageID,
+		SenderID:   senderID,
+		Ciphertext: ciphertext,
+		Nonce:      nonce,
+	}
+
+	item, err := attributevalue.MarshalMap(message)
+	if err != nil {
+		return fmt.Errorf("marshal message: %w", err)
+	}
+
+	_, err = r.client.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(r.tableName),
+		Item:      item,
+	})
+	if err != nil {
+		return fmt.Errorf("put message: %w", err)
+	}
+	return nil
+}
+
+// GetMessages queries encrypted messages for a chat room, returning the most recent entries first.
+func (r *DynamoRepo) GetMessages(ctx context.Context, chatRoomID string, limit int32) ([]models.Message, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+
+	output, err := r.client.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(r.tableName),
+		KeyConditionExpression: aws.String("chat_room_id = :room"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":room": &types.AttributeValueMemberS{Value: chatRoomID},
+		},
+		ScanIndexForward: aws.Bool(false),
+		Limit:            aws.Int32(limit),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("query messages: %w", err)
+	}
+
+	messages := make([]models.Message, 0, len(output.Items))
+	for _, item := range output.Items {
+		var message models.Message
+		if err := attributevalue.UnmarshalMap(item, &message); err != nil {
+			return nil, fmt.Errorf("unmarshal message: %w", err)
+		}
+		messages = append(messages, message)
+	}
+
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].Timestamp < messages[j].Timestamp
+	})
+
+	return messages, nil
 }
 
 // PingDynamoDB verifies connectivity by describing the configured messages table.
