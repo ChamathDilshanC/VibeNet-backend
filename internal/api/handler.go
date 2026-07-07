@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/auth"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
@@ -64,6 +65,26 @@ type publicKeyResponse struct {
 	PublicKey string `json:"public_key"`
 }
 
+type pinToggleRequest struct {
+	RequirePIN bool `json:"require_pin"`
+}
+
+type pinToggleResponse struct {
+	RequirePIN bool `json:"require_pin"`
+}
+
+type chatPINResponse struct {
+	PIN       string    `json:"pin"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// userSearchResult exposes only discovery-safe fields — the actual PIN is never returned.
+type userSearchResult struct {
+	UserID     string `json:"user_id"`
+	Username   string `json:"username"`
+	RequirePIN bool   `json:"require_pin"`
+}
+
 type errorResponse struct {
 	Error string `json:"error"`
 }
@@ -81,6 +102,9 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 		r.Group(func(r chi.Router) {
 			r.Use(h.JWTAuthMiddleware)
 			r.Put("/user/public-key", h.UpdatePublicKey)
+			r.Put("/user/settings/pin-toggle", h.ToggleChatPIN)
+			r.Get("/user/my-pin", h.GetMyChatPIN)
+			r.Get("/users/search", h.SearchUsers)
 			r.Get("/users/{id}/key", h.GetUserPublicKey)
 		})
 	})
@@ -212,6 +236,10 @@ func (h *Handler) UpdatePublicKey(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetUserPublicKey returns a user's E2EE public key for message encryption on the client.
+//
+// If the target user has enabled the anti-spam rotating PIN, the caller must present the
+// current PIN via the optional `?pin=xxxx` query parameter. A missing, wrong, or expired
+// PIN results in 403 Forbidden.
 func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 	idParam := chi.URLParam(r, "id")
 	userID, err := uuid.Parse(idParam)
@@ -220,20 +248,103 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	publicKey, err := h.postgres.GetPublicKey(r.Context(), userID)
+	providedPIN := strings.TrimSpace(r.URL.Query().Get("pin"))
+
+	publicKey, err := h.postgres.GetPublicKey(r.Context(), userID, providedPIN)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+		switch {
+		case errors.Is(err, db.ErrChatPINRequired):
+			writeError(w, http.StatusForbidden, "invalid or expired PIN")
+			return
+		case errors.Is(err, gorm.ErrRecordNotFound):
 			writeError(w, http.StatusNotFound, "public key not found")
 			return
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to fetch public key")
+			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to fetch public key")
-		return
 	}
 
 	writeJSON(w, http.StatusOK, publicKeyResponse{
 		UserID:    userID.String(),
 		PublicKey: publicKey,
 	})
+}
+
+// ToggleChatPIN enables or disables the authenticated user's anti-spam chat PIN requirement.
+// Expects JSON body {"require_pin": true|false}.
+func (h *Handler) ToggleChatPIN(w http.ResponseWriter, r *http.Request) {
+	var req pinToggleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if err := h.postgres.ToggleChatPIN(r.Context(), userID, req.RequirePIN); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to update pin setting")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, pinToggleResponse{RequirePIN: req.RequirePIN})
+}
+
+// GetMyChatPIN returns the authenticated user's currently active 4-digit PIN, generating a
+// fresh one when none exists or the previous PIN has expired.
+func (h *Handler) GetMyChatPIN(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	pin, expiry, err := h.postgres.GetOrRefreshChatPIN(r.Context(), userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch pin")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, chatPINResponse{PIN: pin, ExpiresAt: expiry})
+}
+
+// SearchUsers finds users by username prefix for chat discovery. It returns the user ID,
+// username, and require_pin flag only — the actual PIN is never exposed.
+func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
+	query := strings.TrimSpace(r.URL.Query().Get("username"))
+	if query == "" {
+		writeError(w, http.StatusBadRequest, "username query parameter is required")
+		return
+	}
+
+	users, err := h.postgres.SearchUsersByUsername(r.Context(), query, 20)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to search users")
+		return
+	}
+
+	results := make([]userSearchResult, 0, len(users))
+	for i := range users {
+		results = append(results, userSearchResult{
+			UserID:     users[i].UserID.String(),
+			Username:   users[i].Username,
+			RequirePIN: users[i].RequireChatPIN,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"results": results})
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {

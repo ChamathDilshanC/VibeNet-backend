@@ -106,6 +106,7 @@ sequenceDiagram
 - **Google OAuth 2.0** — One-click sign-in with automatic user provisioning and deferred public-key upload.
 - **JWT Authentication** — Stateless bearer tokens secure REST endpoints and WebSocket upgrades.
 - **Dual-Database Strategy** — PostgreSQL (RDS) for users, contacts, and public keys; DynamoDB for encrypted message history.
+- **Anti-Spam Rotating PIN** — Users can mandate a 4-digit PIN (valid for 5 mins) required by strangers to initiate a chat.
 - **Concurrent WebSocket Routing** — Hub-based connection pooling with non-blocking `go func()` writes to DynamoDB alongside real-time delivery.
 - **Production-Ready Stack** — Chi router, CORS, bcrypt password hashing, GORM, and AWS SDK v2.
 
@@ -123,7 +124,10 @@ sequenceDiagram
 | `GET` | `/api/auth/google/login` | — | Redirects to the Google OAuth consent screen |
 | `GET` | `/api/auth/google/callback` | — | Handles the OAuth callback and returns a JWT |
 | `PUT` | `/api/user/public-key` | JWT | Upload or update the authenticated user's E2EE public key |
-| `GET` | `/api/users/{id}/key` | JWT | Fetch a user's public key for client-side encryption |
+| `PUT` | `/api/user/settings/pin-toggle` | JWT | Enable/disable the anti-spam chat PIN — body `{ "require_pin": true }` |
+| `GET` | `/api/user/my-pin` | JWT | Return the caller's active 4-digit PIN (auto-refreshed if missing/expired) |
+| `GET` | `/api/users/search?username={uname}` | JWT | Search users by username; returns `user_id`, `username`, `require_pin` (never the PIN) |
+| `GET` | `/api/users/{id}/key?pin={pin}` | JWT | Fetch a user's public key; `pin` required when the target mandates a chat PIN |
 
 ### WebSocket
 

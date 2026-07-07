@@ -5,9 +5,11 @@ package db
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"time"
 
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
@@ -17,6 +19,13 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+// chatPINTTL defines how long a freshly generated chat-initiation PIN stays valid.
+const chatPINTTL = 5 * time.Minute
+
+// ErrChatPINRequired is returned when a target user mandates a chat PIN and the
+// supplied PIN is missing, incorrect, or expired. Callers should map this to 403.
+var ErrChatPINRequired = errors.New("invalid or expired chat PIN")
 
 // PostgresConfig holds the connection parameters for the AWS RDS PostgreSQL instance.
 type PostgresConfig struct {
@@ -160,18 +169,109 @@ func (r *PostgresRepo) GetUserByID(ctx context.Context, userID uuid.UUID) (*mode
 }
 
 // GetPublicKey returns the E2EE public key for a user, used by peers before encrypting messages.
-func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID) (string, error) {
+//
+// When the target user has enabled the anti-spam rotating PIN (RequireChatPIN), the
+// caller must supply the current 4-digit providedPIN. The PIN is validated against the
+// stored value and its expiry; a missing, incorrect, or expired PIN yields
+// ErrChatPINRequired so the API layer can respond with 403 Forbidden.
+func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID, providedPIN string) (string, error) {
 	var user models.User
 	if err := r.db.WithContext(ctx).
-		Select("public_key").
+		Select("public_key", "require_chat_pin", "chat_pin", "chat_pin_expiry").
 		Where("user_id = ?", userID).
 		First(&user).Error; err != nil {
 		return "", err
 	}
+
+	if user.RequireChatPIN {
+		if providedPIN == "" || providedPIN != user.ChatPIN || !time.Now().Before(user.ChatPINExpiry) {
+			return "", ErrChatPINRequired
+		}
+	}
+
 	if user.PublicKey == nil || *user.PublicKey == "" {
 		return "", gorm.ErrRecordNotFound
 	}
 	return *user.PublicKey, nil
+}
+
+// ToggleChatPIN enables or disables the anti-spam chat-initiation PIN requirement for a user.
+// Disabling the requirement leaves any previously generated PIN in place but inert.
+func (r *PostgresRepo) ToggleChatPIN(ctx context.Context, userID uuid.UUID, require bool) error {
+	result := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("require_chat_pin", require)
+	if result.Error != nil {
+		return fmt.Errorf("toggle chat pin: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+// GenerateChatPIN issues a fresh random 4-digit numeric PIN, sets its expiry to
+// now + 5 minutes, persists both to the user's record, and returns them.
+func (r *PostgresRepo) GenerateChatPIN(ctx context.Context, userID uuid.UUID) (string, time.Time, error) {
+	pin, err := randomPIN()
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("generate chat pin: %w", err)
+	}
+	expiry := time.Now().Add(chatPINTTL)
+
+	result := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Updates(map[string]interface{}{
+			"chat_pin":        pin,
+			"chat_pin_expiry": expiry,
+		})
+	if result.Error != nil {
+		return "", time.Time{}, fmt.Errorf("persist chat pin: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return "", time.Time{}, gorm.ErrRecordNotFound
+	}
+	return pin, expiry, nil
+}
+
+// GetOrRefreshChatPIN returns the user's currently active PIN and expiry, transparently
+// generating a new one when none exists or the existing PIN has expired.
+func (r *PostgresRepo) GetOrRefreshChatPIN(ctx context.Context, userID uuid.UUID) (string, time.Time, error) {
+	var user models.User
+	if err := r.db.WithContext(ctx).
+		Select("chat_pin", "chat_pin_expiry").
+		Where("user_id = ?", userID).
+		First(&user).Error; err != nil {
+		return "", time.Time{}, err
+	}
+	if user.ChatPIN != "" && time.Now().Before(user.ChatPINExpiry) {
+		return user.ChatPIN, user.ChatPINExpiry, nil
+	}
+	return r.GenerateChatPIN(ctx, userID)
+}
+
+// SearchUsersByUsername performs a case-insensitive prefix search over usernames for
+// chat discovery. It returns full user records; callers must project only safe fields
+// (never the ChatPIN) into their responses. Results are capped by limit.
+func (r *PostgresRepo) SearchUsersByUsername(ctx context.Context, query string, limit int) ([]models.User, error) {
+	var users []models.User
+	if err := r.db.WithContext(ctx).
+		Where("username ILIKE ?", query+"%").
+		Order("username ASC").
+		Limit(limit).
+		Find(&users).Error; err != nil {
+		return nil, fmt.Errorf("search users by username: %w", err)
+	}
+	return users, nil
+}
+
+// randomPIN returns a cryptographically random, zero-padded 4-digit numeric string ("0000"-"9999").
+func randomPIN() (string, error) {
+	n, err := rand.Int(rand.Reader, big.NewInt(10000))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%04d", n.Int64()), nil
 }
 
 // PingPostgres verifies that the PostgreSQL connection is alive.
