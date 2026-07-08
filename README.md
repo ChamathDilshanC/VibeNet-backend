@@ -118,7 +118,7 @@ sequenceDiagram
 
 | Method | Endpoint | Auth | Description |
 |--------|----------|------|-------------|
-| `GET` | `/health` | — | Health check — returns `ok` |
+| `GET` | `/health` | — | Deep health check — pings PostgreSQL & DynamoDB, returns per-service status, latency, and uptime ([details](#health-check)) |
 | `POST` | `/api/auth/register` | — | Register with `username`, `password`, and E2EE `public_key` |
 | `POST` | `/api/auth/login` | — | Standard login — returns a signed JWT |
 | `GET` | `/api/auth/google/login` | — | Redirects to the Google OAuth consent screen |
@@ -128,6 +128,69 @@ sequenceDiagram
 | `GET` | `/api/user/my-pin` | JWT | Return the caller's active 4-digit PIN (auto-refreshed if missing/expired) |
 | `GET` | `/api/users/search?username={uname}` | JWT | Search users by username; returns `user_id`, `username`, `require_pin` (never the PIN) |
 | `GET` | `/api/users/{id}/key?pin={pin}` | JWT | Fetch a user's public key; `pin` required when the target mandates a chat PIN |
+
+### Health Check
+
+`GET /health` is a **deep** liveness/readiness probe. On every request it opens a 3-second
+context and actively pings both data stores in parallel with their individual round-trip
+latency, so it reflects live connectivity rather than a static "the process is up" flag.
+The JSON body is pretty-printed by default.
+
+**Response — all healthy (`200 OK`):**
+
+```json
+{
+  "status": "ok",
+  "service": "vibenet-backend",
+  "version": "1.0.0",
+  "environment": "development",
+  "timestamp": "2026-07-08T08:27:31Z",
+  "uptime_seconds": 142,
+  "services": {
+    "postgres": { "status": "up", "latency_ms": 18 },
+    "dynamodb": { "status": "up", "latency_ms": 42 }
+  }
+}
+```
+
+**Response — a dependency is down (`503 Service Unavailable`):**
+
+```json
+{
+  "status": "degraded",
+  "service": "vibenet-backend",
+  "version": "1.0.0",
+  "environment": "development",
+  "timestamp": "2026-07-08T08:27:31Z",
+  "uptime_seconds": 142,
+  "services": {
+    "postgres": { "status": "down", "latency_ms": 3001, "error": "ping postgres: context deadline exceeded" },
+    "dynamodb": { "status": "up", "latency_ms": 40 }
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `status` | `ok` when every dependency is reachable, else `degraded` |
+| `service` / `version` / `environment` | Service identity; `version` is overridable via `APP_VERSION`, `environment` via `APP_ENV` |
+| `timestamp` | Server time in UTC (RFC 3339) |
+| `uptime_seconds` | Seconds since the process started |
+| `services.<name>.status` | `up` or `down` for each dependency |
+| `services.<name>.latency_ms` | Ping round-trip time in milliseconds |
+| `services.<name>.error` | Present only when that dependency is `down` |
+
+**HTTP status codes:** `200` when healthy, `503` when any dependency is down — so load
+balancers, Kubernetes probes, and uptime monitors can gate traffic on the status code alone.
+
+> ⚠️ **Production note:** the `error` field can expose internal details (host names, driver
+> messages). If you expose `/health` publicly, set `APP_ENV=production` and consider stripping
+> the `error` field or placing the endpoint behind authentication.
+
+```bash
+# Quick check
+curl -s http://localhost:8080/health | jq
+```
 
 ### WebSocket
 

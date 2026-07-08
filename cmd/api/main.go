@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -78,9 +79,78 @@ func main() {
 		MaxAge:           300,
 	}))
 
-	router.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+	startTime := time.Now()
+	appVersion := utils.GetEnv("APP_VERSION", "1.0.0")
+
+	router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		healthCtx, healthCancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer healthCancel()
+
+		type serviceHealth struct {
+			Status    string `json:"status"`
+			LatencyMS int64  `json:"latency_ms"`
+			Error     string `json:"error,omitempty"`
+		}
+
+		// check runs a single dependency ping and records its round-trip latency.
+		check := func(ping func() error) serviceHealth {
+			start := time.Now()
+			err := ping()
+			result := serviceHealth{LatencyMS: time.Since(start).Milliseconds()}
+			if err != nil {
+				result.Status = "down"
+				result.Error = err.Error()
+			} else {
+				result.Status = "up"
+			}
+			return result
+		}
+
+		services := map[string]serviceHealth{
+			"postgres": check(func() error { return db.PingPostgres(healthCtx, postgresDB) }),
+			"dynamodb": check(func() error {
+				return db.PingDynamoDB(healthCtx, dynamoClient, db.MessagesTableName(dynamoCfg))
+			}),
+		}
+
+		healthy := true
+		for _, s := range services {
+			if s.Status != "up" {
+				healthy = false
+			}
+		}
+
+		response := struct {
+			Status        string                   `json:"status"`
+			Service       string                   `json:"service"`
+			Version       string                   `json:"version"`
+			Environment   string                   `json:"environment"`
+			Timestamp     string                   `json:"timestamp"`
+			UptimeSeconds int64                    `json:"uptime_seconds"`
+			Services      map[string]serviceHealth `json:"services"`
+		}{
+			Service:       "vibenet-backend",
+			Version:       appVersion,
+			Environment:   utils.GetEnv("APP_ENV", "development"),
+			Timestamp:     time.Now().UTC().Format(time.RFC3339),
+			UptimeSeconds: int64(time.Since(startTime).Seconds()),
+			Services:      services,
+		}
+		if healthy {
+			response.Status = "ok"
+		} else {
+			response.Status = "degraded"
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if healthy {
+			w.WriteHeader(http.StatusOK)
+		} else {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+		encoder := json.NewEncoder(w)
+		encoder.SetIndent("", "  ") // pretty-print by default
+		_ = encoder.Encode(response)
 	})
 
 	apiHandler.RegisterRoutes(router)
