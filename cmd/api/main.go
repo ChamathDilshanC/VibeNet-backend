@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -70,8 +71,20 @@ func main() {
 	router.Use(middleware.RealIP)
 	router.Use(middleware.Logger)
 	router.Use(middleware.Recoverer)
+	// CORS_ALLOWED_ORIGINS is a comma-separated list; split it into individual
+	// origins so multiple front-ends (e.g. dev + production) are matched correctly.
+	allowedOrigins := make([]string, 0)
+	for _, origin := range strings.Split(utils.GetEnv("CORS_ALLOWED_ORIGINS", "*"), ",") {
+		if trimmed := strings.TrimSpace(origin); trimmed != "" {
+			allowedOrigins = append(allowedOrigins, trimmed)
+		}
+	}
+	if len(allowedOrigins) == 0 {
+		allowedOrigins = []string{"*"}
+	}
+
 	router.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{utils.GetEnv("CORS_ALLOWED_ORIGINS", "*")},
+		AllowedOrigins:   allowedOrigins,
 		AllowedMethods:   []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodOptions},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type"},
 		ExposedHeaders:   []string{"Link"},
