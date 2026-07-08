@@ -280,32 +280,75 @@ The backend is designed for the **AWS Free Tier**. Because it holds long-lived *
 connections for real-time chat, it needs an **always-on** host — an **EC2 `t3.micro`** instance
 (free for 12 months) is the recommended target, living in the same VPC as RDS and DynamoDB.
 
+> **Live endpoint:** the reference deployment runs at **`https://vibenet-api.duckdns.org`** — a free [DuckDNS](https://www.duckdns.org) subdomain pointed at the EC2 public IP, fronted by nginx with a Let's Encrypt certificate.
+
 ### Diagram C — Production Topology (AWS EC2)
 
 ```mermaid
 flowchart LR
     subgraph Internet["Public Internet"]
         User["Browser / Client"]
+        DUCK["DuckDNS<br/>vibenet-api.duckdns.org<br/>A record → EC2 IP"]
     end
 
     subgraph AWS["AWS — ap-southeast-1 (same VPC)"]
-        subgraph EC2["EC2 t3.micro — Ubuntu"]
-            NGINX["nginx :443<br/>(TLS + WS upgrade)"]
-            SVC["vibenet-api<br/>systemd service :8080"]
+        subgraph EC2["EC2 t3.micro — Ubuntu 24.04"]
+            SG{{"Security Group<br/>SSH 22 → My IP<br/>80 · 443 → public"}}
+            NGINX["nginx :443<br/>TLS (Let's Encrypt / certbot)<br/>+ WS upgrade"]
+            SVC["vibenet-api<br/>systemd service :8080<br/>always-on · auto-restart"]
         end
         PG[("RDS PostgreSQL<br/>:5432")]
         DDB[("DynamoDB<br/>vibenet-messages")]
     end
 
-    User -->|"HTTPS / WSS"| NGINX
-    NGINX -->|"reverse proxy"| SVC
+    User -->|"resolve"| DUCK
+    DUCK -->|"HTTPS / WSS"| SG
+    SG --> NGINX
+    NGINX -->|"reverse proxy · localhost:8080"| SVC
     SVC -->|"SG-to-SG (private)"| PG
-    SVC -->|"IAM role"| DDB
+    SVC -->|"IAM keys / role"| DDB
 
     style EC2 fill:#00ADD8,color:#fff,stroke:#007a9e
     style PG fill:#336791,color:#fff,stroke:#1a3d5c
     style DDB fill:#4053D6,color:#fff,stroke:#2a3690
 ```
+
+### Live Deployment Walkthrough
+
+The sequence below reflects the **exact path** used to take this backend from a blank EC2 instance to a public HTTPS endpoint. The numbered guides in [`docs/`](docs/) expand every stage.
+
+```mermaid
+flowchart LR
+    S1["1 · Launch EC2<br/>t3.micro · Ubuntu"]
+    S2["2 · Security Group<br/>SSH · 80 · 443"]
+    S3["3 · SSH + go build<br/><i>2G swap for OOM</i>"]
+    S4["4 · .env<br/>prod secrets"]
+    S5["5 · RDS SG-to-SG"]
+    S6["6 · systemd<br/>always-on"]
+    S7["7 · DuckDNS + nginx<br/>+ certbot · HTTPS 🔒"]
+
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7
+
+    style S1 fill:#20344a,color:#fff,stroke:#61DAFB
+    style S2 fill:#20344a,color:#fff,stroke:#61DAFB
+    style S3 fill:#123038,color:#fff,stroke:#00ADD8
+    style S4 fill:#123038,color:#fff,stroke:#00ADD8
+    style S5 fill:#14233b,color:#fff,stroke:#4169E1
+    style S6 fill:#1e1b2e,color:#fff,stroke:#6E56CF
+    style S7 fill:#123821,color:#fff,stroke:#2EA44F
+```
+
+| # | Stage | What happens | Result |
+|---|-------|--------------|--------|
+| **1** | **EC2 launch** | `t3.micro` (free tier), Ubuntu 24.04, RSA `.pem` key | Always-on host + public IP |
+| **2** | **Security group** | SSH `22` → *My IP*; HTTP `80` + HTTPS `443` → public; `8080` closed after HTTPS is live | Locked-down inbound surface |
+| **3** | **Build** | `apt` Go + git, `go build ./cmd/api`; **2 GB swap** added so the compiler survives the OOM on 1 GB RAM | `vibenet-api` binary |
+| **4** | **Config** | Production `.env` — fresh `JWT_SECRET`, RDS creds, IAM keys, `APP_ENV=production` | Runtime configured |
+| **5** | **RDS connectivity** | Security-group-to-security-group rule (EC2 SG → RDS SG, port `5432`) | DB reachable privately, never public |
+| **6** | **systemd service** | `vibenet.service` — `Restart=always`, `EnvironmentFile=.env`, enabled on boot | 24/7 auto-healing backend |
+| **7** | **Domain + HTTPS** | Free **DuckDNS** subdomain → EC2 IP; **nginx** reverse proxy + **Let's Encrypt** (certbot) with auto-renewal & WebSocket upgrade headers | `https://vibenet-api.duckdns.org` 🔒 |
+
+> **Verify end-to-end:** `curl -s https://vibenet-api.duckdns.org/health | jq` should return `status: ok` with both `postgres` and `dynamodb` reporting `up`.
 
 ### Step-by-Step Guides
 
