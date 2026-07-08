@@ -389,12 +389,17 @@ flowchart LR
         FMT["gofmt -l"] --> VET["go vet"] --> BUILD["go build"] --> TEST["go test"]
     end
 
-    subgraph CD["🚀 deploy.yml — SSH Delivery"]
+    subgraph CD["🚀 deploy.yml · job 1 — SSH Delivery"]
         direction TB
         SSH["appleboy/ssh-action<br/>→ EC2 (key auth)"] --> PULL["git pull origin main"]
         PULL --> REBUILD["go build -o vibenet-api"]
         REBUILD --> RESTART["sudo systemctl restart vibenet"]
         RESTART --> VERIFY["systemctl is-active ✅"]
+    end
+
+    subgraph REL["🏷 deploy.yml · job 2 — Release"]
+        direction TB
+        TAG["tag v1.0.N"] --> GHREL["GitHub Release<br/>+ auto-generated notes"]
     end
 
     LIVE(["🌐 https://vibenet-api.duckdns.org"])
@@ -403,9 +408,11 @@ flowchart LR
     CI -->|"on success · main only"| CD
     CI -.->|"on failure · block"| STOP["❌ deploy skipped"]
     CD --> LIVE
+    CD -->|"needs: deploy"| REL
 
     style CI fill:#123038,stroke:#00ADD8,color:#fff
     style CD fill:#123821,stroke:#2EA44F,color:#fff
+    style REL fill:#2a2016,stroke:#d29922,color:#fff
     style STOP fill:#3a1620,stroke:#e5484d,color:#fff
     style LIVE fill:#14233b,stroke:#4169E1,color:#fff
 ```
@@ -415,7 +422,10 @@ flowchart LR
 | Workflow | Trigger | Steps | Purpose |
 |----------|---------|-------|---------|
 | [`ci.yml`](.github/workflows/ci.yml) | push & PR to `main` | `gofmt` → `go vet` → `go build` → `go test` | Fail fast on formatting, static, or compile errors |
-| [`deploy.yml`](.github/workflows/deploy.yml) | `workflow_run` after CI **succeeds** on `main` | SSH → `git pull` → `go build` → `systemctl restart` → health-gate | Zero-touch delivery to the EC2 host |
+| [`deploy.yml`](.github/workflows/deploy.yml) · **job 1** `deploy` | `workflow_run` after CI **succeeds** on `main` | SSH → `git pull` → `go build` → `systemctl restart` → health-gate | Zero-touch delivery to the EC2 host (`production` environment) |
+| [`deploy.yml`](.github/workflows/deploy.yml) · **job 2** `release` | `needs: deploy` (runs on deploy success) | Tag `v1.0.N` → GitHub Release with auto-generated notes | Immutable, versioned record of every production deploy |
+
+Each successful deploy is tracked under the repo's **Environments → production**, and every deploy cuts a matching entry under **Releases**.
 
 ### Required Repository Secrets
 
