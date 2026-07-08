@@ -95,6 +95,10 @@ func main() {
 	startTime := time.Now()
 	appVersion := utils.GetEnv("APP_VERSION", "1.0.0")
 
+	// Root landing / API documentation page, plus a clean JSON 404 for unknown routes.
+	router.Get("/", api.LandingHandler(appVersion, utils.GetEnv("APP_ENV", "development")))
+	router.NotFound(api.NotFoundHandler())
+
 	router.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		healthCtx, healthCancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer healthCancel()
