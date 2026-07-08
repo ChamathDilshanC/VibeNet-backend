@@ -11,7 +11,7 @@
 
 **Blind-router backend for a scalable, end-to-end encrypted real-time chat platform.**
 
-[Features](#key-features) · [Architecture](#architecture--visualizations) · [API Reference](#api-reference) · [Local Setup](#local-setup--installation) · [Deployment](#deployment) · [Project Structure](#project-structure)
+[Features](#key-features) · [Architecture](#architecture--visualizations) · [API Reference](#api-reference) · [Local Setup](#local-setup--installation) · [Deployment](#deployment) · [CI/CD](#cicd-pipeline) · [Project Structure](#project-structure)
 
 </div>
 
@@ -370,6 +370,67 @@ and free-tier cost notes.
 
 Provisioning RDS, DynamoDB, IAM, JWT, and Google OAuth from scratch is documented in the
 repo-root [`AWS_SETUP_GUIDE.md`](../AWS_SETUP_GUIDE.md).
+
+---
+
+## CI/CD Pipeline
+
+Two [GitHub Actions](.github/workflows/) workflows automate quality gates and delivery. A broken
+build **never** reaches the server — the deploy job runs only after CI succeeds on `main`.
+
+### Diagram D — Automated Build → Deploy Flow
+
+```mermaid
+flowchart LR
+    DEV["👨‍💻 git push<br/>/ pull request"]
+
+    subgraph CI["🧪 ci.yml — Quality Gates"]
+        direction TB
+        FMT["gofmt -l"] --> VET["go vet"] --> BUILD["go build"] --> TEST["go test"]
+    end
+
+    subgraph CD["🚀 deploy.yml — SSH Delivery"]
+        direction TB
+        SSH["appleboy/ssh-action<br/>→ EC2 (key auth)"] --> PULL["git pull origin main"]
+        PULL --> REBUILD["go build -o vibenet-api"]
+        REBUILD --> RESTART["sudo systemctl restart vibenet"]
+        RESTART --> VERIFY["systemctl is-active ✅"]
+    end
+
+    LIVE(["🌐 https://vibenet-api.duckdns.org"])
+
+    DEV --> CI
+    CI -->|"on success · main only"| CD
+    CI -.->|"on failure · block"| STOP["❌ deploy skipped"]
+    CD --> LIVE
+
+    style CI fill:#123038,stroke:#00ADD8,color:#fff
+    style CD fill:#123821,stroke:#2EA44F,color:#fff
+    style STOP fill:#3a1620,stroke:#e5484d,color:#fff
+    style LIVE fill:#14233b,stroke:#4169E1,color:#fff
+```
+
+### Workflows
+
+| Workflow | Trigger | Steps | Purpose |
+|----------|---------|-------|---------|
+| [`ci.yml`](.github/workflows/ci.yml) | push & PR to `main` | `gofmt` → `go vet` → `go build` → `go test` | Fail fast on formatting, static, or compile errors |
+| [`deploy.yml`](.github/workflows/deploy.yml) | `workflow_run` after CI **succeeds** on `main` | SSH → `git pull` → `go build` → `systemctl restart` → health-gate | Zero-touch delivery to the EC2 host |
+
+### Required Repository Secrets
+
+Configure under **Settings → Secrets and variables → Actions**:
+
+| Secret | Value | Notes |
+|--------|-------|-------|
+| `EC2_HOST` | `vibenet-api.duckdns.org` | Stable DuckDNS name — survives EC2 IP changes |
+| `EC2_USER` | `ubuntu` | Default Ubuntu AMI login |
+| `EC2_SSH_KEY` | contents of `vibenet-key.pem` | Full PEM incl. `BEGIN`/`END` lines — key-only auth |
+
+> [!NOTE]
+> The deploy job SSHes in from GitHub's runners, so the EC2 security group must allow inbound
+> SSH (`22`) from those dynamic IPs. Password auth is disabled server-side
+> (`PasswordAuthentication no`), so access stays **key-only**.
 
 ---
 
