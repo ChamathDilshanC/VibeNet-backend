@@ -11,7 +11,7 @@
 
 **Blind-router backend for a scalable, end-to-end encrypted real-time chat platform.**
 
-[Features](#key-features) · [Architecture](#architecture--visualizations) · [API Reference](#api-reference) · [Local Setup](#local-setup--installation) · [Project Structure](#project-structure)
+[Features](#key-features) · [Architecture](#architecture--visualizations) · [API Reference](#api-reference) · [Local Setup](#local-setup--installation) · [Deployment](#deployment) · [Project Structure](#project-structure)
 
 </div>
 
@@ -245,7 +245,8 @@ Edit `.env` with your credentials. At minimum, set:
 | `AWS_REGION`, `DYNAMODB_MESSAGES_TABLE` | DynamoDB configuration |
 | `JWT_SECRET` | Token signing secret |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL` | OAuth 2.0 |
-| `CORS_ALLOWED_ORIGINS` | Allowed frontend origins |
+| `CORS_ALLOWED_ORIGINS` | Allowed frontend origins — **comma-separated** for multiple (e.g. `http://localhost:5173,https://vibenet.app`) |
+| `APP_ENV`, `APP_VERSION` | Environment label and version string surfaced by `/health` (optional) |
 
 > **Tip:** For local DynamoDB, uncomment `DYNAMODB_ENDPOINT=http://localhost:8000` in `.env`.
 
@@ -258,9 +259,74 @@ go run ./cmd/api
 The API starts on `http://localhost:8080` (configurable via `APP_PORT`).
 
 ```bash
-curl http://localhost:8080/health
-# ok
+curl -s http://localhost:8080/health | jq
+# {
+#   "status": "ok",
+#   "service": "vibenet-backend",
+#   "services": {
+#     "postgres": { "status": "up", "latency_ms": 4 },
+#     "dynamodb": { "status": "up", "latency_ms": 12 }
+#   }
+# }
 ```
+
+A `status: ok` with both services `up` confirms PostgreSQL and DynamoDB are reachable. See [Health Check](#health-check) for the full response schema.
+
+---
+
+## Deployment
+
+The backend is designed for the **AWS Free Tier**. Because it holds long-lived **WebSocket**
+connections for real-time chat, it needs an **always-on** host — an **EC2 `t3.micro`** instance
+(free for 12 months) is the recommended target, living in the same VPC as RDS and DynamoDB.
+
+### Diagram C — Production Topology (AWS EC2)
+
+```mermaid
+flowchart LR
+    subgraph Internet["Public Internet"]
+        User["Browser / Client"]
+    end
+
+    subgraph AWS["AWS — ap-southeast-1 (same VPC)"]
+        subgraph EC2["EC2 t3.micro — Ubuntu"]
+            NGINX["nginx :443<br/>(TLS + WS upgrade)"]
+            SVC["vibenet-api<br/>systemd service :8080"]
+        end
+        PG[("RDS PostgreSQL<br/>:5432")]
+        DDB[("DynamoDB<br/>vibenet-messages")]
+    end
+
+    User -->|"HTTPS / WSS"| NGINX
+    NGINX -->|"reverse proxy"| SVC
+    SVC -->|"SG-to-SG (private)"| PG
+    SVC -->|"IAM role"| DDB
+
+    style EC2 fill:#00ADD8,color:#fff,stroke:#007a9e
+    style PG fill:#336791,color:#fff,stroke:#1a3d5c
+    style DDB fill:#4053D6,color:#fff,stroke:#2a3690
+```
+
+### Step-by-Step Guides
+
+Full, beginner-friendly walkthroughs — launch to HTTPS — are in [`docs/`](docs/):
+
+| Guide | Language |
+|-------|----------|
+| [EC2 Deployment Guide](docs/DEPLOYMENT.md) | 🌐 English |
+| [EC2 Deployment Guide](docs/DEPLOYMENT.si.md) | 🇱🇰 සිංහල |
+
+They cover launching the instance, security groups, SSH, building the binary, the `.env`,
+EC2→RDS connectivity, running as a `systemd` service, optional nginx + TLS, health verification,
+and free-tier cost notes.
+
+> ⚠️ **Not Vercel/serverless:** persistent WebSocket connections rule out serverless
+> functions. Use an always-on host — AWS EC2/Lightsail, or platforms like Render/Railway/Fly.io.
+
+### Cloud Resource Setup
+
+Provisioning RDS, DynamoDB, IAM, JWT, and Google OAuth from scratch is documented in the
+repo-root [`AWS_SETUP_GUIDE.md`](../AWS_SETUP_GUIDE.md).
 
 ---
 
@@ -279,6 +345,9 @@ VibeNet-backend/
 │   └── websocket/               # Hub, Client, and WebSocket upgrade handler
 ├── pkg/
 │   └── utils/                   # Shared helpers (environment variable loading)
+├── docs/
+│   ├── DEPLOYMENT.md            # AWS EC2 deployment guide (English)
+│   └── DEPLOYMENT.si.md         # AWS EC2 deployment guide (සිංහල)
 ├── .env.example                 # Environment variable template
 ├── go.mod
 └── go.sum
