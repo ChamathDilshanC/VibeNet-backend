@@ -21,12 +21,12 @@ const (
 
 // inboundMessage is the encrypted payload sent by a connected client over WebSocket.
 type inboundMessage struct {
-	MessageID   string `json:"message_id"`
-	ReceiverID  string `json:"receiver_id"`
-	ChatRoomID  string `json:"chat_room_id"`
-	Ciphertext  string `json:"ciphertext"`
-	Nonce       string `json:"nonce"`
-	Timestamp   int64  `json:"timestamp"`
+	MessageID  string `json:"message_id"`
+	ReceiverID string `json:"receiver_id"`
+	ChatRoomID string `json:"chat_room_id"`
+	Ciphertext string `json:"ciphertext"`
+	Nonce      string `json:"nonce"`
+	Timestamp  int64  `json:"timestamp"`
 }
 
 // outboundMessage is the encrypted payload delivered to a recipient's WebSocket connection.
@@ -41,11 +41,11 @@ type outboundMessage struct {
 
 // Client represents a single authenticated WebSocket connection bound to a VibeNet user.
 type Client struct {
-	hub      *Hub
-	conn     *websocket.Conn
-	send     chan []byte
-	userID   uuid.UUID
-	dynamo   *db.DynamoRepo
+	hub    *Hub
+	conn   *websocket.Conn
+	send   chan []byte
+	userID uuid.UUID
+	dynamo *db.DynamoRepo
 }
 
 // NewClient constructs a Client for the authenticated user and begins read/write pumps.
