@@ -12,6 +12,10 @@
 *.out
 coverage.out
 
+# SSH keys / secrets
+keys/
+*.pem
+
 # Environment files
 .env
 .env.local
