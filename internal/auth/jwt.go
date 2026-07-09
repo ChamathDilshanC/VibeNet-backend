@@ -29,7 +29,12 @@ type JWTManager struct {
 type GoogleOAuthConfig struct {
 	ClientID     string
 	ClientSecret string
-	RedirectURL  string
+	// RedirectURL is Google's callback into this backend (the Authorized redirect URI).
+	RedirectURL string
+	// FrontendURL is the base origin of the SPA. After a successful Google sign-in the
+	// backend redirects the browser to <FrontendURL>/auth/google-success?token=... so the
+	// front-end can capture the issued JWT and store the session.
+	FrontendURL string
 }
 
 // LoadGoogleOAuthConfig builds GoogleOAuthConfig from environment variables.
@@ -38,6 +43,7 @@ func LoadGoogleOAuthConfig() GoogleOAuthConfig {
 		ClientID:     utils.GetEnv("GOOGLE_CLIENT_ID", ""),
 		ClientSecret: utils.GetEnv("GOOGLE_CLIENT_SECRET", ""),
 		RedirectURL:  utils.GetEnv("GOOGLE_REDIRECT_URL", ""),
+		FrontendURL:  utils.GetEnv("FRONTEND_URL", "http://localhost:3000"),
 	}
 }
 

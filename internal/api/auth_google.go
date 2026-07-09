@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/auth"
@@ -98,6 +99,20 @@ func (h *Handler) GoogleCallback(w http.ResponseWriter, r *http.Request) {
 	jwtToken, err := h.jwt.GenerateToken(user.UserID, user.Username)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate token")
+		return
+	}
+
+	// Hand the session back to the SPA by bouncing the browser to the front-end
+	// success page with the issued JWT as a query parameter. The page reads the
+	// token, stores the session, and immediately strips it from the URL. When no
+	// front-end origin is configured, fall back to raw JSON.
+	if h.googleOAuth.FrontendURL != "" {
+		redirectURL := fmt.Sprintf(
+			"%s/auth/google-success?token=%s",
+			strings.TrimRight(h.googleOAuth.FrontendURL, "/"),
+			url.QueryEscape(jwtToken),
+		)
+		http.Redirect(w, r, redirectURL, http.StatusFound)
 		return
 	}
 
