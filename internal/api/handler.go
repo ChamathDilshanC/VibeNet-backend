@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -367,7 +368,15 @@ type chatMessageDTO struct {
 // participants encoded in the room id — see chatRoomIdFor on the frontend, which
 // derives it as the two user IDs sorted and joined with ":".
 func (h *Handler) GetChatHistory(w http.ResponseWriter, r *http.Request) {
-	chatRoomID := chi.URLParam(r, "chatRoomID")
+	// chi.URLParam returns the raw, still-percent-encoded path segment (e.g. a
+	// client-side encodeURIComponent turns the ":" separator into "%3A") — it
+	// does not decode it the way r.URL.Path does. Unescape explicitly rather
+	// than relying on the caller not to encode it.
+	chatRoomID, err := url.PathUnescape(chi.URLParam(r, "chatRoomID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid chat room id")
+		return
+	}
 
 	userID, ok := UserIDFromContext(r.Context())
 	if !ok {
