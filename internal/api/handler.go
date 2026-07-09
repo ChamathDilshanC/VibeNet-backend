@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,15 +20,17 @@ import (
 // Handler groups REST dependencies for auth and user routes.
 type Handler struct {
 	postgres    *db.PostgresRepo
+	dynamo      *db.DynamoRepo
 	jwt         *auth.JWTManager
 	googleOAuth *auth.GoogleOAuthConfig
 }
 
 // NewHandler constructs an API handler with the required persistence and auth services.
-func NewHandler(postgres *db.PostgresRepo, jwtManager *auth.JWTManager, googleCfg auth.GoogleOAuthConfig) *Handler {
+func NewHandler(postgres *db.PostgresRepo, dynamo *db.DynamoRepo, jwtManager *auth.JWTManager, googleCfg auth.GoogleOAuthConfig) *Handler {
 	cfgCopy := googleCfg
 	return &Handler{
 		postgres:    postgres,
+		dynamo:      dynamo,
 		jwt:         jwtManager,
 		googleOAuth: &cfgCopy,
 	}
@@ -106,6 +109,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Get("/user/my-pin", h.GetMyChatPIN)
 			r.Get("/users/search", h.SearchUsers)
 			r.Get("/users/{id}/key", h.GetUserPublicKey)
+			r.Get("/messages/{chatRoomID}", h.GetChatHistory)
 		})
 	})
 }
@@ -345,6 +349,63 @@ func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"results": results})
+}
+
+// chatMessageDTO exposes a stored message's ciphertext and routing metadata only —
+// the backend never has, and never returns, plaintext.
+type chatMessageDTO struct {
+	MessageID  string `json:"message_id"`
+	SenderID   string `json:"sender_id"`
+	Ciphertext string `json:"ciphertext"`
+	Nonce      string `json:"nonce"`
+	Timestamp  int64  `json:"timestamp"`
+}
+
+// GetChatHistory returns cached encrypted messages for a chat room, letting a client
+// catch up on messages sent while it was offline (the WebSocket hub only delivers to
+// currently-connected clients and does not queue). Access is restricted to the two
+// participants encoded in the room id — see chatRoomIdFor on the frontend, which
+// derives it as the two user IDs sorted and joined with ":".
+func (h *Handler) GetChatHistory(w http.ResponseWriter, r *http.Request) {
+	chatRoomID := chi.URLParam(r, "chatRoomID")
+
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	parts := strings.Split(chatRoomID, ":")
+	if len(parts) != 2 || (parts[0] != userID.String() && parts[1] != userID.String()) {
+		writeError(w, http.StatusForbidden, "not a participant of this chat room")
+		return
+	}
+
+	limit := int32(50)
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 && parsed <= 200 {
+			limit = int32(parsed)
+		}
+	}
+
+	messages, err := h.dynamo.GetMessages(r.Context(), chatRoomID, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to fetch message history")
+		return
+	}
+
+	dtos := make([]chatMessageDTO, 0, len(messages))
+	for i := range messages {
+		dtos = append(dtos, chatMessageDTO{
+			MessageID:  messages[i].MessageID,
+			SenderID:   messages[i].SenderID,
+			Ciphertext: messages[i].Ciphertext,
+			Nonce:      messages[i].Nonce,
+			Timestamp:  messages[i].Timestamp,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{"messages": dtos})
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {

@@ -146,6 +146,7 @@ const landingHTML = `<!doctype html>
           <tr><td class="method m-get">GET</td><td><code>/api/user/my-pin</code></td><td><span class="pill jwt">JWT</span></td><td>Return the caller's active 4-digit PIN</td></tr>
           <tr><td class="method m-get">GET</td><td><code>/api/users/search</code></td><td><span class="pill jwt">JWT</span></td><td>Search users by username for chat discovery</td></tr>
           <tr><td class="method m-get">GET</td><td><code>/api/users/{id}/key</code></td><td><span class="pill jwt">JWT</span></td><td>Fetch a user's public key (PIN required if mandated)</td></tr>
+          <tr><td class="method m-get">GET</td><td><code>/api/messages/{chatRoomID}</code></td><td><span class="pill jwt">JWT</span></td><td>Fetch cached encrypted message history for a chat room (participants only)</td></tr>
         </tbody>
       </table>
     </div>

@@ -62,7 +62,7 @@ func main() {
 	jwtManager := auth.NewJWTManager()
 	googleCfg := auth.LoadGoogleOAuthConfig()
 
-	apiHandler := api.NewHandler(postgresRepo, jwtManager, googleCfg)
+	apiHandler := api.NewHandler(postgresRepo, dynamoRepo, jwtManager, googleCfg)
 	wsHub := websocket.NewHub()
 	wsHandler := websocket.NewHandler(wsHub, apiHandler, dynamoRepo)
 
