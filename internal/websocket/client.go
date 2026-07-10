@@ -19,8 +19,20 @@ const (
 	sendBufferSize = 256
 )
 
-// inboundMessage is the encrypted payload sent by a connected client over WebSocket.
+// Frame types exchanged over the WebSocket. The Type field discriminates chat
+// messages from delivery/read control frames; an empty type is treated as a
+// chat message for backward compatibility.
+const (
+	frameMessage = "message"
+	frameAck     = "ack"
+	frameRead    = "read"
+)
+
+// inboundMessage is a frame sent by a connected client. For a chat message it
+// carries the encrypted payload; for a "read" frame only Type, ReceiverID (the
+// original sender to notify) and ChatRoomID are used.
 type inboundMessage struct {
+	Type       string `json:"type"`
 	MessageID  string `json:"message_id"`
 	ReceiverID string `json:"receiver_id"`
 	ChatRoomID string `json:"chat_room_id"`
@@ -31,12 +43,30 @@ type inboundMessage struct {
 
 // outboundMessage is the encrypted payload delivered to a recipient's WebSocket connection.
 type outboundMessage struct {
+	Type       string `json:"type"`
 	MessageID  string `json:"message_id"`
 	SenderID   string `json:"sender_id"`
 	ChatRoomID string `json:"chat_room_id"`
 	Ciphertext string `json:"ciphertext"`
 	Nonce      string `json:"nonce"`
 	Timestamp  int64  `json:"timestamp"`
+}
+
+// ackFrame tells the original sender whether their message reached an online
+// recipient (delivered=true) or only reached the server (delivered=false).
+type ackFrame struct {
+	Type       string `json:"type"`
+	MessageID  string `json:"message_id"`
+	ChatRoomID string `json:"chat_room_id"`
+	Delivered  bool   `json:"delivered"`
+}
+
+// readFrame tells the original sender that the recipient has read the messages
+// in a chat room — the WhatsApp-style blue double tick.
+type readFrame struct {
+	Type       string `json:"type"`
+	ChatRoomID string `json:"chat_room_id"`
+	ReaderID   string `json:"reader_id"`
 }
 
 // Client represents a single authenticated WebSocket connection bound to a VibeNet user.
@@ -88,19 +118,51 @@ func (c *Client) readPump() {
 	}
 }
 
-// handleMessage validates an inbound encrypted payload, delivers it to the receiver, and persists it.
+// handleMessage decodes an inbound frame and dispatches it by type: a chat
+// message is routed and persisted, a read receipt is forwarded to the sender.
 func (c *Client) handleMessage(raw []byte) {
-	log.Printf("websocket: [1/4] backend received %d bytes from user %s", len(raw), c.userID)
-
 	var inbound inboundMessage
 	if err := json.Unmarshal(raw, &inbound); err != nil {
-		log.Printf("websocket: invalid message payload from user %s: %v", c.userID, err)
+		log.Printf("websocket: invalid frame from user %s: %v", c.userID, err)
 		return
 	}
 
+	switch inbound.Type {
+	case frameRead:
+		c.handleReadReceipt(inbound)
+	default: // frameMessage or empty (backward compatible)
+		c.handleChatMessage(inbound)
+	}
+}
+
+// handleReadReceipt forwards a recipient's "I've read this chat" signal to the
+// original sender so their sent messages can flip to the blue double tick.
+func (c *Client) handleReadReceipt(inbound inboundMessage) {
+	if inbound.ReceiverID == "" || inbound.ChatRoomID == "" {
+		return
+	}
+	senderID, err := uuid.Parse(inbound.ReceiverID)
+	if err != nil {
+		log.Printf("websocket: invalid receiver_id %q on read receipt from user %s", inbound.ReceiverID, c.userID)
+		return
+	}
+
+	payload, err := json.Marshal(readFrame{
+		Type:       frameRead,
+		ChatRoomID: inbound.ChatRoomID,
+		ReaderID:   c.userID.String(),
+	})
+	if err != nil {
+		return
+	}
+	c.hub.DeliverToUser(senderID, payload)
+}
+
+// handleChatMessage validates an inbound encrypted payload, delivers it to the
+// receiver, acknowledges delivery back to the sender, and persists it.
+func (c *Client) handleChatMessage(inbound inboundMessage) {
 	if inbound.ReceiverID == "" || inbound.ChatRoomID == "" || inbound.Ciphertext == "" || inbound.Nonce == "" {
-		log.Printf("websocket: missing required fields from user %s (receiver_id=%q chat_room_id=%q has_ciphertext=%v has_nonce=%v)",
-			c.userID, inbound.ReceiverID, inbound.ChatRoomID, inbound.Ciphertext != "", inbound.Nonce != "")
+		log.Printf("websocket: missing required fields from user %s", c.userID)
 		return
 	}
 
@@ -110,9 +172,6 @@ func (c *Client) handleMessage(raw []byte) {
 		return
 	}
 
-	log.Printf("websocket: [2/4] parsed message %s from %s -> %s (chat_room=%s)",
-		inbound.MessageID, c.userID, receiverID, inbound.ChatRoomID)
-
 	if inbound.Timestamp == 0 {
 		inbound.Timestamp = time.Now().UnixMilli()
 	}
@@ -121,6 +180,7 @@ func (c *Client) handleMessage(raw []byte) {
 	}
 
 	outbound := outboundMessage{
+		Type:       frameMessage,
 		MessageID:  inbound.MessageID,
 		SenderID:   c.userID.String(),
 		ChatRoomID: inbound.ChatRoomID,
@@ -135,20 +195,37 @@ func (c *Client) handleMessage(raw []byte) {
 		return
 	}
 
+	// delivered is true only when the receiver has a live connection and the
+	// message was queued to it — this is the single-tick vs double-tick signal.
 	delivered := c.hub.DeliverToUser(receiverID, payload)
-	log.Printf("websocket: [3/4] routed message %s to %s — delivered=%v (receiver online and buffer accepted the write)",
-		inbound.MessageID, receiverID, delivered)
+	c.trySend(ackFrame{
+		Type:       frameAck,
+		MessageID:  inbound.MessageID,
+		ChatRoomID: inbound.ChatRoomID,
+		Delivered:  delivered,
+	})
 
 	go func(messageID, chatRoomID, senderID, ciphertext, nonce string, timestamp int64) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		if err := c.dynamo.SaveMessage(ctx, messageID, chatRoomID, senderID, ciphertext, nonce, timestamp); err != nil {
-			log.Printf("websocket: [4/4] async dynamodb save failed for message %s: %v", messageID, err)
-			return
+			log.Printf("websocket: async dynamodb save failed for message %s: %v", messageID, err)
 		}
-		log.Printf("websocket: [4/4] async dynamodb save succeeded for message %s", messageID)
 	}(inbound.MessageID, inbound.ChatRoomID, c.userID.String(), inbound.Ciphertext, inbound.Nonce, inbound.Timestamp)
+}
+
+// trySend queues a control frame (ack/read) to this client without blocking:
+// if the buffer is full the frame is dropped, since ticks are best-effort.
+func (c *Client) trySend(v any) {
+	payload, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	select {
+	case c.send <- payload:
+	default:
+	}
 }
 
 // writePump sends queued encrypted payloads to the client and maintains connection health via pings.
