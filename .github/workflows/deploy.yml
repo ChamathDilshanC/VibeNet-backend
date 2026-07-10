@@ -31,7 +31,11 @@ jobs:
           script: |
             set -e
             cd ~/VibeNet-backend
-            git pull origin main
+            # Hard-reset instead of `git pull` so the deploy still succeeds after
+            # a force-push rewrites main history — a plain pull would hit a
+            # divergent branch and fail.
+            git fetch origin main
+            git reset --hard origin/main
             go build -o vibenet-api ./cmd/api
             sudo systemctl restart vibenet
             sleep 3
