@@ -23,22 +23,25 @@ const (
 // messages from delivery/read control frames; an empty type is treated as a
 // chat message for backward compatibility.
 const (
-	frameMessage = "message"
-	frameAck     = "ack"
-	frameRead    = "read"
+	frameMessage  = "message"
+	frameAck      = "ack"
+	frameRead     = "read"
+	framePresence = "presence"
 )
 
 // inboundMessage is a frame sent by a connected client. For a chat message it
 // carries the encrypted payload; for a "read" frame only Type, ReceiverID (the
-// original sender to notify) and ChatRoomID are used.
+// original sender to notify) and ChatRoomID are used; for a "presence" frame
+// only Type and UserIDs (the peers whose online state is being queried).
 type inboundMessage struct {
-	Type       string `json:"type"`
-	MessageID  string `json:"message_id"`
-	ReceiverID string `json:"receiver_id"`
-	ChatRoomID string `json:"chat_room_id"`
-	Ciphertext string `json:"ciphertext"`
-	Nonce      string `json:"nonce"`
-	Timestamp  int64  `json:"timestamp"`
+	Type       string   `json:"type"`
+	MessageID  string   `json:"message_id"`
+	ReceiverID string   `json:"receiver_id"`
+	ChatRoomID string   `json:"chat_room_id"`
+	Ciphertext string   `json:"ciphertext"`
+	Nonce      string   `json:"nonce"`
+	Timestamp  int64    `json:"timestamp"`
+	UserIDs    []string `json:"user_ids"`
 }
 
 // outboundMessage is the encrypted payload delivered to a recipient's WebSocket connection.
@@ -67,6 +70,13 @@ type readFrame struct {
 	Type       string `json:"type"`
 	ChatRoomID string `json:"chat_room_id"`
 	ReaderID   string `json:"reader_id"`
+}
+
+// presenceFrame answers a presence query with the subset of the requested user
+// IDs that currently have a live connection to this hub.
+type presenceFrame struct {
+	Type   string   `json:"type"`
+	Online []string `json:"online"`
 }
 
 // Client represents a single authenticated WebSocket connection bound to a VibeNet user.
@@ -130,9 +140,27 @@ func (c *Client) handleMessage(raw []byte) {
 	switch inbound.Type {
 	case frameRead:
 		c.handleReadReceipt(inbound)
+	case framePresence:
+		c.handlePresence(inbound)
 	default: // frameMessage or empty (backward compatible)
 		c.handleChatMessage(inbound)
 	}
+}
+
+// handlePresence answers a presence query: of the requested user IDs, report
+// back the ones that currently have a live WebSocket connection to this hub.
+func (c *Client) handlePresence(inbound inboundMessage) {
+	online := make([]string, 0, len(inbound.UserIDs))
+	for _, id := range inbound.UserIDs {
+		uid, err := uuid.Parse(id)
+		if err != nil {
+			continue
+		}
+		if c.hub.IsOnline(uid) {
+			online = append(online, id)
+		}
+	}
+	c.trySend(presenceFrame{Type: framePresence, Online: online})
 }
 
 // handleReadReceipt forwards a recipient's "I've read this chat" signal to the
