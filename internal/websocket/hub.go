@@ -35,12 +35,18 @@ func (h *Hub) run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			if existing, ok := h.clients[client.userID]; ok {
-				close(existing.send)
+				// Close only the connection here, not existing.send: DeliverToUser
+				// may be concurrently writing to that channel from another
+				// goroutine, and closing a channel a concurrent sender can still
+				// write to is a "send on closed channel" panic waiting to happen.
+				// Closing the conn makes the old client's own readPump/writePump
+				// notice and unwind (and unregister) on their own.
 				_ = existing.conn.Close()
+				log.Printf("websocket: user %s reconnected, closed previous connection", client.userID)
 			}
 			h.clients[client.userID] = client
 			h.mu.Unlock()
-			log.Printf("websocket: user %s connected", client.userID)
+			log.Printf("websocket: user %s connected (registered in hub)", client.userID)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
@@ -71,11 +77,13 @@ func (h *Hub) DeliverToUser(receiverID uuid.UUID, payload []byte) bool {
 	client, ok := h.clients[receiverID]
 	h.mu.RUnlock()
 	if !ok {
+		log.Printf("websocket: route miss — receiver %s is not connected to this hub", receiverID)
 		return false
 	}
 
 	select {
 	case client.send <- payload:
+		log.Printf("websocket: route hit — payload queued for receiver %s", receiverID)
 		return true
 	default:
 		log.Printf("websocket: send buffer full for user %s", receiverID)

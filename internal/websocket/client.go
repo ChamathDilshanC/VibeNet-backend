@@ -90,22 +90,28 @@ func (c *Client) readPump() {
 
 // handleMessage validates an inbound encrypted payload, delivers it to the receiver, and persists it.
 func (c *Client) handleMessage(raw []byte) {
+	log.Printf("websocket: [1/4] backend received %d bytes from user %s", len(raw), c.userID)
+
 	var inbound inboundMessage
 	if err := json.Unmarshal(raw, &inbound); err != nil {
-		log.Printf("websocket: invalid message payload from user %s", c.userID)
+		log.Printf("websocket: invalid message payload from user %s: %v", c.userID, err)
 		return
 	}
 
 	if inbound.ReceiverID == "" || inbound.ChatRoomID == "" || inbound.Ciphertext == "" || inbound.Nonce == "" {
-		log.Printf("websocket: missing required fields from user %s", c.userID)
+		log.Printf("websocket: missing required fields from user %s (receiver_id=%q chat_room_id=%q has_ciphertext=%v has_nonce=%v)",
+			c.userID, inbound.ReceiverID, inbound.ChatRoomID, inbound.Ciphertext != "", inbound.Nonce != "")
 		return
 	}
 
 	receiverID, err := uuid.Parse(inbound.ReceiverID)
 	if err != nil {
-		log.Printf("websocket: invalid receiver_id from user %s", c.userID)
+		log.Printf("websocket: invalid receiver_id %q from user %s: %v", inbound.ReceiverID, c.userID, err)
 		return
 	}
+
+	log.Printf("websocket: [2/4] parsed message %s from %s -> %s (chat_room=%s)",
+		inbound.MessageID, c.userID, receiverID, inbound.ChatRoomID)
 
 	if inbound.Timestamp == 0 {
 		inbound.Timestamp = time.Now().UnixMilli()
@@ -129,15 +135,19 @@ func (c *Client) handleMessage(raw []byte) {
 		return
 	}
 
-	c.hub.DeliverToUser(receiverID, payload)
+	delivered := c.hub.DeliverToUser(receiverID, payload)
+	log.Printf("websocket: [3/4] routed message %s to %s — delivered=%v (receiver online and buffer accepted the write)",
+		inbound.MessageID, receiverID, delivered)
 
 	go func(messageID, chatRoomID, senderID, ciphertext, nonce string, timestamp int64) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		if err := c.dynamo.SaveMessage(ctx, messageID, chatRoomID, senderID, ciphertext, nonce, timestamp); err != nil {
-			log.Printf("websocket: async dynamodb save failed: %v", err)
+			log.Printf("websocket: [4/4] async dynamodb save failed for message %s: %v", messageID, err)
+			return
 		}
+		log.Printf("websocket: [4/4] async dynamodb save succeeded for message %s", messageID)
 	}(inbound.MessageID, inbound.ChatRoomID, c.userID.String(), inbound.Ciphertext, inbound.Nonce, inbound.Timestamp)
 }
 
