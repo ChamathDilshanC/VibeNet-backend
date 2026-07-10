@@ -24,6 +24,12 @@ type User struct {
 	PublicKey    *string   `gorm:"type:text" json:"public_key,omitempty"`
 	CreatedAt    time.Time `gorm:"autoCreateTime" json:"created_at"`
 
+	// AvatarURL is the profile picture shown throughout the client. It is sourced
+	// from the Google account photo and re-synced on every Google sign-in, so it
+	// tracks changes made in Google. Password accounts have none and fall back to
+	// initials rendered client-side.
+	AvatarURL *string `gorm:"type:text" json:"avatar_url,omitempty"`
+
 	// RequireChatPIN gates public-key retrieval behind a rotating PIN when true.
 	RequireChatPIN bool `gorm:"not null;default:false" json:"require_chat_pin"`
 	// ChatPIN is the current 4-digit numeric PIN; empty when none has been issued.

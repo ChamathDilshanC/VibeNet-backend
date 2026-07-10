@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"strings"
 	"time"
 
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
@@ -26,6 +27,10 @@ const chatPINTTL = 5 * time.Minute
 // ErrChatPINRequired is returned when a target user mandates a chat PIN and the
 // supplied PIN is missing, incorrect, or expired. Callers should map this to 403.
 var ErrChatPINRequired = errors.New("invalid or expired chat PIN")
+
+// ErrUsernameTaken is returned when a profile update would collide with the
+// username of another account. Callers should map this to 409.
+var ErrUsernameTaken = errors.New("username already taken")
 
 // PostgresConfig holds the connection parameters for the AWS RDS PostgreSQL instance.
 type PostgresConfig struct {
@@ -112,10 +117,24 @@ func (r *PostgresRepo) CreateUser(ctx context.Context, username, passwordHash, p
 
 // CreateOrGetUserByGoogle finds an existing Google OAuth user or creates a new account
 // without a password or public key. The client must upload its E2EE public key later.
-func (r *PostgresRepo) CreateOrGetUserByGoogle(ctx context.Context, googleID, email, username string) (*models.User, error) {
+//
+// avatarURL is the Google account photo. On an existing account it is re-synced when it
+// differs from what we hold, so a photo changed in Google shows up after the next sign-in.
+// The username is only used when provisioning: renaming in Google must not silently
+// overwrite a username the person later chose in VibeNet's profile settings.
+func (r *PostgresRepo) CreateOrGetUserByGoogle(ctx context.Context, googleID, email, username, avatarURL string) (*models.User, error) {
 	var existing models.User
 	err := r.db.WithContext(ctx).Where("google_id = ?", googleID).First(&existing).Error
 	if err == nil {
+		if avatarURL != "" && (existing.AvatarURL == nil || *existing.AvatarURL != avatarURL) {
+			if err := r.db.WithContext(ctx).Model(&existing).
+				Update("avatar_url", avatarURL).Error; err != nil {
+				// A stale photo must not block sign-in.
+				log.Printf("refresh google avatar for %s: %v", existing.UserID, err)
+			} else {
+				existing.AvatarURL = &avatarURL
+			}
+		}
 		return &existing, nil
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -129,11 +148,40 @@ func (r *PostgresRepo) CreateOrGetUserByGoogle(ctx context.Context, googleID, em
 		Email:    &emailCopy,
 		GoogleID: &googleIDCopy,
 	}
+	if avatarURL != "" {
+		avatarCopy := avatarURL
+		user.AvatarURL = &avatarCopy
+	}
 
 	if err := r.db.WithContext(ctx).Create(user).Error; err != nil {
 		return nil, fmt.Errorf("create google user: %w", err)
 	}
 	return user, nil
+}
+
+// UpdateProfile renames the authenticated user and returns the updated record.
+// A collision with another account's username yields ErrUsernameTaken.
+func (r *PostgresRepo) UpdateProfile(ctx context.Context, userID uuid.UUID, username string) (*models.User, error) {
+	result := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("username", username)
+	if result.Error != nil {
+		if isUniqueViolation(result.Error) {
+			return nil, ErrUsernameTaken
+		}
+		return nil, fmt.Errorf("update profile: %w", result.Error)
+	}
+	// RowsAffected is 0 both when the user is gone and when the username is
+	// unchanged, so confirm existence by reading the record back.
+	return r.GetUserByID(ctx, userID)
+}
+
+// isUniqueViolation reports whether err is a unique-constraint failure. GORM
+// surfaces the driver error verbatim and pgx is only an indirect dependency
+// here, so match on the message the way the API layer already does.
+func isUniqueViolation(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate") || strings.Contains(msg, "unique")
 }
 
 // UpdatePublicKey persists a user's E2EE public key after OAuth login or key rotation.

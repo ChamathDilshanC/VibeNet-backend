@@ -123,6 +123,8 @@ sequenceDiagram
 | `POST` | `/api/auth/login` | — | Standard login — returns a signed JWT |
 | `GET` | `/api/auth/google/login` | — | Redirects to the Google OAuth consent screen |
 | `GET` | `/api/auth/google/callback` | — | Handles the OAuth callback and returns a JWT |
+| `GET` | `/api/user/me` | JWT | Return the caller's current profile — `user_id`, `username`, `email`, `avatar_url` |
+| `PUT` | `/api/user/profile` | JWT | Rename the caller — body `{ "username": "new_name" }`; `409` when taken |
 | `PUT` | `/api/user/public-key` | JWT | Upload or update the authenticated user's E2EE public key |
 | `PUT` | `/api/user/settings/pin-toggle` | JWT | Enable/disable the anti-spam chat PIN — body `{ "require_pin": true }` |
 | `GET` | `/api/user/my-pin` | JWT | Return the caller's active 4-digit PIN (auto-refreshed if missing/expired) |

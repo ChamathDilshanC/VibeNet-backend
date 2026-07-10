@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +63,11 @@ type userSummary struct {
 	Username  string  `json:"username"`
 	Email     *string `json:"email,omitempty"`
 	PublicKey *string `json:"public_key,omitempty"`
+	AvatarURL *string `json:"avatar_url,omitempty"`
+}
+
+type profileUpdateRequest struct {
+	Username string `json:"username"`
 }
 
 type publicKeyResponse struct {
@@ -105,6 +111,8 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 
 		r.Group(func(r chi.Router) {
 			r.Use(h.JWTAuthMiddleware)
+			r.Get("/user/me", h.GetMe)
+			r.Put("/user/profile", h.UpdateProfile)
 			r.Put("/user/public-key", h.UpdatePublicKey)
 			r.Put("/user/settings/pin-toggle", h.ToggleChatPIN)
 			r.Get("/user/my-pin", h.GetMyChatPIN)
@@ -206,6 +214,87 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		Token: token,
 		User:  toUserSummary(user),
 	})
+}
+
+// GetMe returns the authenticated user's current profile. The JWT only carries
+// user_id and username, so this is how a client learns fields that can change
+// after the token was issued — notably the Google avatar_url.
+func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	user, err := h.postgres.GetUserByID(r.Context(), userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch user")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toUserSummary(user))
+}
+
+// UpdateProfile renames the authenticated user. The username doubles as the
+// display name across the client, so this is the profile edit surface.
+//
+// The issued JWT still carries the old username in its claims; nothing on the
+// server reads that claim (authorization is by user_id), and the token stays
+// valid until it expires.
+func (h *Handler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
+	var req profileUpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	req.Username = strings.TrimSpace(req.Username)
+	if err := validateUsername(req.Username); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	user, err := h.postgres.UpdateProfile(r.Context(), userID, req.Username)
+	if err != nil {
+		switch {
+		case errors.Is(err, db.ErrUsernameTaken):
+			writeError(w, http.StatusConflict, "username already taken")
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			writeError(w, http.StatusNotFound, "user not found")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to update profile")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusOK, toUserSummary(user))
+}
+
+// usernamePattern mirrors the character set auth.DeriveUsername produces for
+// Google accounts, so a provisioned name always survives a round trip through
+// the profile editor.
+var usernamePattern = regexp.MustCompile(`^[a-z0-9._]+$`)
+
+func validateUsername(username string) error {
+	switch {
+	case len(username) < 3:
+		return errors.New("username must be at least 3 characters")
+	case len(username) > 48:
+		return errors.New("username must be at most 48 characters")
+	case !usernamePattern.MatchString(username):
+		return errors.New("username may only contain lowercase letters, numbers, dots, and underscores")
+	}
+	return nil
 }
 
 // UpdatePublicKey stores or updates the authenticated user's E2EE public key.

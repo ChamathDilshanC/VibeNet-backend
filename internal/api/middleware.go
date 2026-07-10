@@ -69,6 +69,7 @@ func toUserSummary(user *models.User) userSummary {
 		Username:  user.Username,
 		Email:     user.Email,
 		PublicKey: user.PublicKey,
+		AvatarURL: user.AvatarURL,
 	}
 }
 
