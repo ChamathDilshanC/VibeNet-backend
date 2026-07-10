@@ -71,8 +71,9 @@ type profileUpdateRequest struct {
 }
 
 type publicKeyResponse struct {
-	UserID    string `json:"user_id"`
-	PublicKey string `json:"public_key"`
+	UserID    string  `json:"user_id"`
+	PublicKey string  `json:"public_key"`
+	AvatarURL *string `json:"avatar_url,omitempty"`
 }
 
 type pinToggleRequest struct {
@@ -90,9 +91,10 @@ type chatPINResponse struct {
 
 // userSearchResult exposes only discovery-safe fields — the actual PIN is never returned.
 type userSearchResult struct {
-	UserID     string `json:"user_id"`
-	Username   string `json:"username"`
-	RequirePIN bool   `json:"require_pin"`
+	UserID     string  `json:"user_id"`
+	Username   string  `json:"username"`
+	RequirePIN bool    `json:"require_pin"`
+	AvatarURL  *string `json:"avatar_url,omitempty"`
 }
 
 type errorResponse struct {
@@ -346,7 +348,7 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 
 	providedPIN := strings.TrimSpace(r.URL.Query().Get("pin"))
 
-	publicKey, err := h.postgres.GetPublicKey(r.Context(), userID, providedPIN)
+	publicKey, avatarURL, err := h.postgres.GetPublicKey(r.Context(), userID, providedPIN)
 	if err != nil {
 		switch {
 		case errors.Is(err, db.ErrChatPINRequired):
@@ -364,6 +366,7 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, publicKeyResponse{
 		UserID:    userID.String(),
 		PublicKey: publicKey,
+		AvatarURL: avatarURL,
 	})
 }
 
@@ -437,6 +440,7 @@ func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 			UserID:     users[i].UserID.String(),
 			Username:   users[i].Username,
 			RequirePIN: users[i].RequireChatPIN,
+			AvatarURL:  users[i].AvatarURL,
 		})
 	}
 

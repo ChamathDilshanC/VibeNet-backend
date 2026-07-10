@@ -232,31 +232,33 @@ func (r *PostgresRepo) GetUserByID(ctx context.Context, userID uuid.UUID) (*mode
 	return &user, nil
 }
 
-// GetPublicKey returns the E2EE public key for a user, used by peers before encrypting messages.
+// GetPublicKey returns the E2EE public key for a user, used by peers before encrypting
+// messages, along with the user's avatar URL so the caller can show a real profile
+// picture for the peer rather than only initials.
 //
 // When the target user has enabled the anti-spam rotating PIN (RequireChatPIN), the
 // caller must supply the current 4-digit providedPIN. The PIN is validated against the
 // stored value and its expiry; a missing, incorrect, or expired PIN yields
 // ErrChatPINRequired so the API layer can respond with 403 Forbidden.
-func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID, providedPIN string) (string, error) {
+func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID, providedPIN string) (string, *string, error) {
 	var user models.User
 	if err := r.db.WithContext(ctx).
-		Select("public_key", "require_chat_pin", "chat_pin", "chat_pin_expiry").
+		Select("public_key", "avatar_url", "require_chat_pin", "chat_pin", "chat_pin_expiry").
 		Where("user_id = ?", userID).
 		First(&user).Error; err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	if user.RequireChatPIN {
 		if providedPIN == "" || providedPIN != user.ChatPIN || !time.Now().Before(user.ChatPINExpiry) {
-			return "", ErrChatPINRequired
+			return "", nil, ErrChatPINRequired
 		}
 	}
 
 	if user.PublicKey == nil || *user.PublicKey == "" {
-		return "", gorm.ErrRecordNotFound
+		return "", nil, gorm.ErrRecordNotFound
 	}
-	return *user.PublicKey, nil
+	return *user.PublicKey, user.AvatarURL, nil
 }
 
 // ToggleChatPIN enables or disables the anti-spam chat-initiation PIN requirement for a user.
