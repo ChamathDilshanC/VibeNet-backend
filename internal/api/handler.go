@@ -280,10 +280,12 @@ func (h *Handler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toUserSummary(user))
 }
 
-// usernamePattern mirrors the character set auth.DeriveUsername produces for
-// Google accounts, so a provisioned name always survives a round trip through
-// the profile editor.
-var usernamePattern = regexp.MustCompile(`^[a-z0-9._]+$`)
+// usernamePattern is a superset of the character set auth.DeriveUsername
+// produces for Google accounts (which is lowercase-only), so a provisioned name
+// always survives a round trip through the profile editor while still letting a
+// user pick a mixed-case display name like "ChamathDilshanC". Uniqueness is
+// enforced case-insensitively in the repository, so casing is cosmetic only.
+var usernamePattern = regexp.MustCompile(`^[A-Za-z0-9._]+$`)
 
 func validateUsername(username string) error {
 	switch {
@@ -292,7 +294,7 @@ func validateUsername(username string) error {
 	case len(username) > 48:
 		return errors.New("username must be at most 48 characters")
 	case !usernamePattern.MatchString(username):
-		return errors.New("username may only contain lowercase letters, numbers, dots, and underscores")
+		return errors.New("username may only contain letters, numbers, dots, and underscores")
 	}
 	return nil
 }

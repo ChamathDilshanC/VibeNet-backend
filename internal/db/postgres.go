@@ -161,7 +161,23 @@ func (r *PostgresRepo) CreateOrGetUserByGoogle(ctx context.Context, googleID, em
 
 // UpdateProfile renames the authenticated user and returns the updated record.
 // A collision with another account's username yields ErrUsernameTaken.
+//
+// Uniqueness is checked case-insensitively so "ChamathDilshanC" and
+// "chamathdilshanc" cannot both exist — this matches the case-insensitive
+// username search (SearchUsersByUsername) and blocks look-alike impersonation
+// that the case-sensitive DB unique index alone would let through. The index
+// remains as a race backstop between this check and the write.
 func (r *PostgresRepo) UpdateProfile(ctx context.Context, userID uuid.UUID, username string) (*models.User, error) {
+	var conflicts int64
+	if err := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("LOWER(username) = LOWER(?) AND user_id <> ?", username, userID).
+		Count(&conflicts).Error; err != nil {
+		return nil, fmt.Errorf("check username availability: %w", err)
+	}
+	if conflicts > 0 {
+		return nil, ErrUsernameTaken
+	}
+
 	result := r.db.WithContext(ctx).Model(&models.User{}).
 		Where("user_id = ?", userID).
 		Update("username", username)
