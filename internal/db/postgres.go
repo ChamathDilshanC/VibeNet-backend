@@ -12,17 +12,12 @@ import (
 	"time"
 
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
-	"github.com/ChamathDilshanC/VibeNet-backend/internal/pin"
 	"github.com/ChamathDilshanC/VibeNet-backend/pkg/utils"
 	"github.com/google/uuid"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
-
-// ErrChatPINRequired is returned when a target user mandates a chat PIN and the
-// supplied PIN is missing or incorrect. Callers should map this to 403.
-var ErrChatPINRequired = errors.New("invalid or expired chat PIN")
 
 // ErrInvalidPinType is returned by UpdatePinSettings for an unknown pin type.
 var ErrInvalidPinType = errors.New("invalid chat pin type")
@@ -321,22 +316,16 @@ func (r *PostgresRepo) GetUserByID(ctx context.Context, userID uuid.UUID) (*mode
 // messages, along with the user's avatar URL so the caller can show a real profile
 // picture for the peer rather than only initials.
 //
-// When the target user has enabled the anti-spam chat PIN (ChatPinEnabled), the
-// caller must supply the current 6-digit providedPIN — either the user's static
-// CustomPin or the active rotating code. Validation is delegated to internal/pin;
-// a missing or incorrect PIN yields ErrChatPINRequired so the API layer can respond
-// with 403 Forbidden.
-func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID, providedPIN string) (string, *string, string, error) {
+// The chat PIN is single-sided: fetching a peer's key is never gated by the peer's
+// PIN. The current user unlocks the chat interface with their own PIN on the client
+// (verified via POST /api/user/verify-pin), so this simply returns the key.
+func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID) (string, *string, string, error) {
 	var user models.User
 	if err := r.db.WithContext(ctx).
-		Select("user_id", "username", "display_name", "public_key", "avatar_url", "chat_pin_enabled", "chat_pin_type", "custom_pin").
+		Select("username", "display_name", "public_key", "avatar_url").
 		Where("user_id = ?", userID).
 		First(&user).Error; err != nil {
 		return "", nil, "", err
-	}
-
-	if !pin.Valid(&user, providedPIN) {
-		return "", nil, "", ErrChatPINRequired
 	}
 
 	if user.PublicKey == nil || *user.PublicKey == "" {

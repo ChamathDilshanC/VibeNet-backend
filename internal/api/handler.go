@@ -135,6 +135,12 @@ type pinSettingsRequest struct {
 	CustomPin *string `json:"custom_pin,omitempty"`
 }
 
+// pinVerifyRequest is the body of POST /api/user/verify-pin — the current user's own
+// PIN, entered to unlock their chat interface.
+type pinVerifyRequest struct {
+	PIN string `json:"pin"`
+}
+
 // pinStatusResponse describes the owner's current chat-PIN state and the code they
 // should share right now. PIN is empty when protection is disabled, or when "static"
 // is selected but no custom PIN has been set. ExpiresAt is set only for rotating
@@ -176,6 +182,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Post("/user/avatar", h.UploadAvatar)
 			r.Put("/user/public-key", h.UpdatePublicKey)
 			r.Put("/user/settings/pin", h.UpdatePinSettings)
+			r.Post("/user/verify-pin", h.VerifyPin)
 			r.Get("/user/my-pin", h.GetMyChatPIN)
 			r.Get("/users/search", h.SearchUsers)
 			r.Get("/users/{id}/key", h.GetUserPublicKey)
@@ -606,11 +613,9 @@ func (h *Handler) UpdatePublicKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "public key updated"})
 }
 
-// GetUserPublicKey returns a user's E2EE public key for message encryption on the client.
-//
-// If the target user has enabled the anti-spam rotating PIN, the caller must present the
-// current PIN via the optional `?pin=xxxx` query parameter. A missing, wrong, or expired
-// PIN results in 403 Forbidden.
+// GetUserPublicKey returns a user's E2EE public key for message encryption on the
+// client. The chat PIN is single-sided (the current user unlocks the interface with
+// their own PIN via VerifyPin), so fetching a peer's key is not PIN-gated here.
 func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 	idParam := chi.URLParam(r, "id")
 	userID, err := uuid.Parse(idParam)
@@ -619,21 +624,14 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	providedPIN := strings.TrimSpace(r.URL.Query().Get("pin"))
-
-	publicKey, avatarURL, displayName, err := h.postgres.GetPublicKey(r.Context(), userID, providedPIN)
+	publicKey, avatarURL, displayName, err := h.postgres.GetPublicKey(r.Context(), userID)
 	if err != nil {
-		switch {
-		case errors.Is(err, db.ErrChatPINRequired):
-			writeError(w, http.StatusForbidden, "invalid or expired PIN")
-			return
-		case errors.Is(err, gorm.ErrRecordNotFound):
+		if errors.Is(err, gorm.ErrRecordNotFound) {
 			writeError(w, http.StatusNotFound, "public key not found")
 			return
-		default:
-			writeError(w, http.StatusInternalServerError, "failed to fetch public key")
-			return
 		}
+		writeError(w, http.StatusInternalServerError, "failed to fetch public key")
+		return
 	}
 
 	writeJSON(w, http.StatusOK, publicKeyResponse{
@@ -642,6 +640,41 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 		PublicKey:   publicKey,
 		AvatarURL:   avatarURL,
 	})
+}
+
+// VerifyPin checks a PIN the authenticated user entered to unlock their own chat
+// interface against their own active PIN (static custom PIN or current rotating
+// code). Returns 200 {"valid":true} on success, 403 on a wrong PIN. When the user
+// has the PIN disabled there is nothing to check, so it succeeds.
+func (h *Handler) VerifyPin(w http.ResponseWriter, r *http.Request) {
+	var req pinVerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	user, err := h.postgres.GetUserByID(r.Context(), userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify pin")
+		return
+	}
+
+	if !pin.Valid(user, strings.TrimSpace(req.PIN)) {
+		writeError(w, http.StatusForbidden, "incorrect PIN")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"valid": true})
 }
 
 // UpdatePinSettings persists the authenticated user's chat-PIN configuration:
