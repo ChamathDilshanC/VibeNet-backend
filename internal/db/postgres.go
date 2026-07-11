@@ -32,6 +32,14 @@ var ErrChatPINRequired = errors.New("invalid or expired chat PIN")
 // username of another account. Callers should map this to 409.
 var ErrUsernameTaken = errors.New("username already taken")
 
+// ErrEmailTaken and ErrPhoneTaken are returned by CreateUser when the requested
+// email or phone number already belongs to another account. They are distinct so
+// the API layer can tell the caller exactly which field collided. Map both to 409.
+var (
+	ErrEmailTaken = errors.New("email already registered")
+	ErrPhoneTaken = errors.New("phone number already registered")
+)
+
 // PostgresConfig holds the connection parameters for the AWS RDS PostgreSQL instance.
 type PostgresConfig struct {
 	Host     string
@@ -101,18 +109,52 @@ func NewPostgresRepo(database *gorm.DB) *PostgresRepo {
 }
 
 // CreateUser inserts a new standard-registration user with a bcrypt password hash and E2EE public key.
-func (r *PostgresRepo) CreateUser(ctx context.Context, username, passwordHash, publicKey string, email *string) (*models.User, error) {
+//
+// Before inserting, it checks whether the email or phone number is already taken and
+// returns ErrEmailTaken / ErrPhoneTaken so the caller can report the exact collision.
+// The pre-check is best-effort for a friendly message; the unique indexes on email and
+// phone_number remain the source of truth and back-stop the race between check and write
+// (a concurrent duplicate surfaces as isUniqueViolation below).
+func (r *PostgresRepo) CreateUser(ctx context.Context, username, passwordHash, publicKey string, email, phoneNumber *string) (*models.User, error) {
+	if email != nil {
+		var count int64
+		if err := r.db.WithContext(ctx).Model(&models.User{}).
+			Where("email = ?", *email).Count(&count).Error; err != nil {
+			return nil, fmt.Errorf("check email availability: %w", err)
+		}
+		if count > 0 {
+			return nil, ErrEmailTaken
+		}
+	}
+	if phoneNumber != nil {
+		var count int64
+		if err := r.db.WithContext(ctx).Model(&models.User{}).
+			Where("phone_number = ?", *phoneNumber).Count(&count).Error; err != nil {
+			return nil, fmt.Errorf("check phone availability: %w", err)
+		}
+		if count > 0 {
+			return nil, ErrPhoneTaken
+		}
+	}
+
 	user := &models.User{
 		Username: username,
 		// Password accounts have no external "real name" source, so the username
 		// doubles as the initial display name. It stays fully editable in settings.
 		DisplayName:  username,
 		Email:        email,
+		PhoneNumber:  phoneNumber,
 		PasswordHash: &passwordHash,
 		PublicKey:    &publicKey,
 	}
 
 	if err := r.db.WithContext(ctx).Create(user).Error; err != nil {
+		// Lost the race with a concurrent registration: the unique index rejected
+		// the row. We can't tell which column collided from the driver message, so
+		// report the email conflict — the far more common case at sign-up.
+		if isUniqueViolation(err) {
+			return nil, ErrEmailTaken
+		}
 		return nil, fmt.Errorf("create user: %w", err)
 	}
 	return user, nil

@@ -23,8 +23,13 @@ type User struct {
 	// accounts, the Google account name for OAuth) and fully editable in profile
 	// settings. It carries no uniqueness constraint — two people may share a real
 	// name. Clients fall back to Username when it is empty (see toUserSummary).
-	DisplayName  string    `gorm:"type:varchar(64);not null;default:''" json:"display_name"`
-	Email        *string   `gorm:"type:varchar(255);uniqueIndex" json:"email,omitempty"`
+	DisplayName string  `gorm:"type:varchar(64);not null;default:''" json:"display_name"`
+	Email       *string `gorm:"type:varchar(255);uniqueIndex" json:"email,omitempty"`
+	// PhoneNumber is captured at password sign-up and, like Email, is unique across
+	// accounts. It is a pointer so pre-existing and Google OAuth rows (which never
+	// supply one) store NULL rather than colliding on an empty string in the unique
+	// index. Never revealed to peers — only serialized back to the owner.
+	PhoneNumber  *string   `gorm:"type:varchar(32);uniqueIndex" json:"phone_number,omitempty"`
 	GoogleID     *string   `gorm:"type:varchar(255);uniqueIndex" json:"-"`
 	PasswordHash *string   `gorm:"type:text" json:"-"`
 	PublicKey    *string   `gorm:"type:text" json:"public_key,omitempty"`

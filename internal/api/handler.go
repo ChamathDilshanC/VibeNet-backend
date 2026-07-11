@@ -56,9 +56,11 @@ func (h *Handler) SetBroadcaster(b Broadcaster) {
 }
 
 type registerRequest struct {
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	PublicKey string `json:"public_key"`
+	Username    string `json:"username"`
+	Password    string `json:"password"`
+	Email       string `json:"email"`
+	PhoneNumber string `json:"phone_number"`
+	PublicKey   string `json:"public_key"`
 }
 
 type loginRequest struct {
@@ -80,6 +82,7 @@ type userSummary struct {
 	Username    string  `json:"username"`
 	DisplayName string  `json:"display_name"`
 	Email       *string `json:"email,omitempty"`
+	PhoneNumber *string `json:"phone_number,omitempty"`
 	PublicKey   *string `json:"public_key,omitempty"`
 	AvatarURL   *string `json:"avatar_url,omitempty"`
 }
@@ -167,12 +170,24 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 	req.Username = strings.TrimSpace(req.Username)
 	req.PublicKey = strings.TrimSpace(req.PublicKey)
-	if req.Username == "" || req.Password == "" || req.PublicKey == "" {
-		writeError(w, http.StatusBadRequest, "username, password, and public_key are required")
+	req.Email = strings.TrimSpace(req.Email)
+	// Normalize the phone number to digits (and an optional leading "+") so the
+	// same number typed with different separators maps to one stored value.
+	req.PhoneNumber = phoneSeparators.ReplaceAllString(strings.TrimSpace(req.PhoneNumber), "")
+	if req.Username == "" || req.Password == "" || req.PublicKey == "" || req.Email == "" || req.PhoneNumber == "" {
+		writeError(w, http.StatusBadRequest, "username, password, email, phone_number, and public_key are required")
 		return
 	}
 	if len(req.Password) < 8 {
 		writeError(w, http.StatusBadRequest, "password must be at least 8 characters")
+		return
+	}
+	if err := validateEmail(req.Email); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := validatePhoneNumber(req.PhoneNumber); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -182,13 +197,20 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	user, err := h.postgres.CreateUser(r.Context(), req.Username, string(hash), req.PublicKey, nil)
+	email := req.Email
+	phone := req.PhoneNumber
+	user, err := h.postgres.CreateUser(r.Context(), req.Username, string(hash), req.PublicKey, &email, &phone)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "duplicate") || strings.Contains(strings.ToLower(err.Error()), "unique") {
+		switch {
+		case errors.Is(err, db.ErrEmailTaken):
+			writeError(w, http.StatusConflict, "email already registered")
+		case errors.Is(err, db.ErrPhoneTaken):
+			writeError(w, http.StatusConflict, "phone number already registered")
+		case strings.Contains(strings.ToLower(err.Error()), "duplicate") || strings.Contains(strings.ToLower(err.Error()), "unique"):
 			writeError(w, http.StatusConflict, "username already exists")
-			return
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to create user")
 		}
-		writeError(w, http.StatusInternalServerError, "failed to create user")
 		return
 	}
 
@@ -370,6 +392,38 @@ func validateUsername(username string) error {
 	}
 	return nil
 }
+
+// emailPattern is a deliberately permissive check — enough to reject obvious
+// typos (missing "@" or domain) without trying to fully model RFC 5322. Real
+// deliverability isn't verified since VibeNet doesn't send email at sign-up.
+var emailPattern = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
+
+func validateEmail(email string) error {
+	switch {
+	case len(email) > 255:
+		return errors.New("email must be at most 255 characters")
+	case !emailPattern.MatchString(email):
+		return errors.New("please enter a valid email address")
+	}
+	return nil
+}
+
+// phonePattern accepts an optional leading "+" followed by 7–15 digits, matching
+// the E.164 range. Separators (spaces, dashes, parentheses) are stripped by the
+// caller before validation, so only digits and the "+" reach here.
+var phonePattern = regexp.MustCompile(`^\+?[0-9]{7,15}$`)
+
+func validatePhoneNumber(phone string) error {
+	if !phonePattern.MatchString(phone) {
+		return errors.New("please enter a valid phone number")
+	}
+	return nil
+}
+
+// phoneSeparators matches the human-friendly grouping characters people type into
+// a phone field; they are removed before storage so the same number entered as
+// "+1 (555) 010-1234" or "+15550101234" collides in the unique index.
+var phoneSeparators = regexp.MustCompile(`[\s().-]`)
 
 // validateDisplayName bounds the free-form "real name". Unlike the username it
 // allows spaces and mixed case (it is a human name, not a handle) but is capped
