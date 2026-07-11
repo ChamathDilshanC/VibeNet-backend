@@ -23,10 +23,12 @@ const (
 // messages from delivery/read control frames; an empty type is treated as a
 // chat message for backward compatibility.
 const (
-	frameMessage  = "message"
-	frameAck      = "ack"
-	frameRead     = "read"
-	framePresence = "presence"
+	frameMessage        = "message"
+	frameAck            = "ack"
+	frameRead           = "read"
+	framePresence       = "presence"
+	frameTyping         = "typing"
+	framePresenceUpdate = "presence_update"
 )
 
 // inboundMessage is a frame sent by a connected client. For a chat message it
@@ -42,6 +44,9 @@ type inboundMessage struct {
 	Nonce      string   `json:"nonce"`
 	Timestamp  int64    `json:"timestamp"`
 	UserIDs    []string `json:"user_ids"`
+	// IsTyping is set on a "typing" frame: true while the sender is composing,
+	// false when they stop. Routed to the receiver like a read receipt.
+	IsTyping bool `json:"is_typing"`
 }
 
 // outboundMessage is the encrypted payload delivered to a recipient's WebSocket connection.
@@ -77,6 +82,25 @@ type readFrame struct {
 type presenceFrame struct {
 	Type   string   `json:"type"`
 	Online []string `json:"online"`
+}
+
+// typingFrame is routed to the receiver when a peer starts/stops composing, so
+// their client can show or hide the typing indicator for the sender.
+type typingFrame struct {
+	Type       string `json:"type"`
+	SenderID   string `json:"sender_id"`
+	ChatRoomID string `json:"chat_room_id"`
+	IsTyping   bool   `json:"is_typing"`
+}
+
+// presenceUpdateFrame is broadcast when a user connects or disconnects, so peers
+// update their online/last-seen display immediately rather than waiting for the
+// next presence poll. LastSeen (unix ms) is set only on the offline transition.
+type presenceUpdateFrame struct {
+	Type     string `json:"type"`
+	UserID   string `json:"user_id"`
+	IsOnline bool   `json:"is_online"`
+	LastSeen *int64 `json:"last_seen,omitempty"`
 }
 
 // Client represents a single authenticated WebSocket connection bound to a VibeNet user.
@@ -142,9 +166,35 @@ func (c *Client) handleMessage(raw []byte) {
 		c.handleReadReceipt(inbound)
 	case framePresence:
 		c.handlePresence(inbound)
+	case frameTyping:
+		c.handleTyping(inbound)
 	default: // frameMessage or empty (backward compatible)
 		c.handleChatMessage(inbound)
 	}
+}
+
+// handleTyping forwards a composing/stopped signal to the receiver so their
+// client can toggle the typing indicator. Carries no content — purely a UI hint.
+func (c *Client) handleTyping(inbound inboundMessage) {
+	if inbound.ReceiverID == "" || inbound.ChatRoomID == "" {
+		return
+	}
+	receiverID, err := uuid.Parse(inbound.ReceiverID)
+	if err != nil {
+		log.Printf("websocket: invalid receiver_id %q on typing frame from user %s", inbound.ReceiverID, c.userID)
+		return
+	}
+
+	payload, err := json.Marshal(typingFrame{
+		Type:       frameTyping,
+		SenderID:   c.userID.String(),
+		ChatRoomID: inbound.ChatRoomID,
+		IsTyping:   inbound.IsTyping,
+	})
+	if err != nil {
+		return
+	}
+	c.hub.DeliverToUser(receiverID, payload)
 }
 
 // handlePresence answers a presence query: of the requested user IDs, report

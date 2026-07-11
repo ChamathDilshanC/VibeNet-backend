@@ -114,6 +114,9 @@ type publicKeyResponse struct {
 	DisplayName string  `json:"display_name"`
 	PublicKey   string  `json:"public_key"`
 	AvatarURL   *string `json:"avatar_url,omitempty"`
+	// LastSeen is unix milliseconds of the peer's last disconnect, so the client
+	// can show "last seen ..." when they're offline. Omitted if never recorded.
+	LastSeen *int64 `json:"last_seen,omitempty"`
 }
 
 // userUpdateBroadcast is pushed to every connected client when a user edits
@@ -625,7 +628,7 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	publicKey, avatarURL, displayName, err := h.postgres.GetPublicKey(r.Context(), userID)
+	publicKey, avatarURL, displayName, lastSeen, err := h.postgres.GetPublicKey(r.Context(), userID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			writeError(w, http.StatusNotFound, "public key not found")
@@ -635,11 +638,18 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var lastSeenMS *int64
+	if lastSeen != nil {
+		ms := lastSeen.UnixMilli()
+		lastSeenMS = &ms
+	}
+
 	writeJSON(w, http.StatusOK, publicKeyResponse{
 		UserID:      userID.String(),
 		DisplayName: displayName,
 		PublicKey:   publicKey,
 		AvatarURL:   avatarURL,
+		LastSeen:    lastSeenMS,
 	})
 }
 

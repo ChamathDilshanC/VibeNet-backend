@@ -63,7 +63,7 @@ func main() {
 	googleCfg := auth.LoadGoogleOAuthConfig()
 
 	apiHandler := api.NewHandler(postgresRepo, dynamoRepo, jwtManager, googleCfg)
-	wsHub := websocket.NewHub()
+	wsHub := websocket.NewHub(postgresRepo)
 	// Let the REST layer push live profile updates (user_update) to connected
 	// clients. Wired after construction to avoid an api⇄websocket import cycle.
 	apiHandler.SetBroadcaster(wsHub)

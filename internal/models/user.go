@@ -43,6 +43,13 @@ type User struct {
 	// initials rendered client-side.
 	AvatarURL *string `gorm:"type:text" json:"avatar_url,omitempty"`
 
+	// LastSeen is the moment the user's last live WebSocket connection dropped. The
+	// hub stamps it on disconnect (see internal/websocket) so peers can show
+	// "last seen ..." while the user is offline. Nil until their first disconnect
+	// after the column was introduced. Peers read it via GetPublicKey and via the
+	// presence_update the hub broadcasts when a user goes offline.
+	LastSeen *time.Time `gorm:"type:timestamptz" json:"last_seen,omitempty"`
+
 	// ChatPinEnabled gates public-key retrieval behind a chat PIN when true. New
 	// accounts default to true (set explicitly at registration — see CreateUser —
 	// because GORM can't distinguish an unset bool from a deliberate false).

@@ -3,9 +3,13 @@
 package websocket
 
 import (
+	"context"
+	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
 	"github.com/google/uuid"
 )
 
@@ -15,14 +19,19 @@ type Hub struct {
 	register   chan *Client
 	unregister chan *Client
 	mu         sync.RWMutex
+	// postgres stamps last_seen when a user disconnects. Optional (nil in tests):
+	// presence broadcasts still fire, only the DB write is skipped.
+	postgres *db.PostgresRepo
 }
 
-// NewHub creates and starts a Hub event loop in a background goroutine.
-func NewHub() *Hub {
+// NewHub creates and starts a Hub event loop in a background goroutine. postgres
+// may be nil (e.g. in tests) to skip last-seen persistence.
+func NewHub(postgres *db.PostgresRepo) *Hub {
 	hub := &Hub{
 		clients:    make(map[uuid.UUID]*Client),
 		register:   make(chan *Client),
 		unregister: make(chan *Client),
+		postgres:   postgres,
 	}
 	go hub.run()
 	return hub
@@ -47,17 +56,58 @@ func (h *Hub) run() {
 			h.clients[client.userID] = client
 			h.mu.Unlock()
 			log.Printf("websocket: user %s connected (registered in hub)", client.userID)
+			// Tell peers this user just came online, so their header flips to
+			// "Online" instantly instead of on the next presence poll.
+			go h.broadcastPresence(client.userID, true, nil)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
+			removed := false
 			if current, ok := h.clients[client.userID]; ok && current == client {
 				delete(h.clients, client.userID)
 				close(client.send)
+				removed = true
 			}
 			h.mu.Unlock()
 			log.Printf("websocket: user %s disconnected", client.userID)
+			// Only when this was a real removal (not a reconnect that replaced the
+			// old connection): stamp last_seen and tell peers they went offline.
+			if removed {
+				go h.handleDisconnect(client.userID)
+			}
 		}
 	}
+}
+
+// handleDisconnect records the user's last-seen time and broadcasts their offline
+// transition. Runs off the hub goroutine so the DB write never blocks routing.
+func (h *Hub) handleDisconnect(userID uuid.UUID) {
+	now := time.Now()
+	if h.postgres != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := h.postgres.UpdateLastSeen(ctx, userID, now); err != nil {
+			log.Printf("websocket: update last_seen for %s failed: %v", userID, err)
+		}
+	}
+	ms := now.UnixMilli()
+	h.broadcastPresence(userID, false, &ms)
+}
+
+// broadcastPresence pushes an online/offline transition for userID to every
+// connected client (best-effort — see Broadcast). lastSeen is set only for the
+// offline transition.
+func (h *Hub) broadcastPresence(userID uuid.UUID, online bool, lastSeen *int64) {
+	payload, err := json.Marshal(presenceUpdateFrame{
+		Type:     framePresenceUpdate,
+		UserID:   userID.String(),
+		IsOnline: online,
+		LastSeen: lastSeen,
+	})
+	if err != nil {
+		return
+	}
+	h.Broadcast(payload)
 }
 
 // Register adds a client to the hub's active connection pool.

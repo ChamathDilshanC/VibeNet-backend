@@ -280,6 +280,23 @@ func (r *PostgresRepo) UpdateAvatarURL(ctx context.Context, userID uuid.UUID, av
 	return r.GetUserByID(ctx, userID)
 }
 
+// UpdateLastSeen stamps the user's last-seen time (called by the websocket hub when
+// their connection drops). Best-effort presence metadata: a missing user is not an
+// error worth surfacing, so zero rows affected is reported as gorm.ErrRecordNotFound
+// only for the caller to log, not to treat as fatal.
+func (r *PostgresRepo) UpdateLastSeen(ctx context.Context, userID uuid.UUID, t time.Time) error {
+	result := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("last_seen", t)
+	if result.Error != nil {
+		return fmt.Errorf("update last seen: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 // UpdatePublicKey persists a user's E2EE public key after OAuth login or key rotation.
 func (r *PostgresRepo) UpdatePublicKey(ctx context.Context, userID uuid.UUID, publicKey string) error {
 	result := r.db.WithContext(ctx).Model(&models.User{}).
@@ -319,19 +336,19 @@ func (r *PostgresRepo) GetUserByID(ctx context.Context, userID uuid.UUID) (*mode
 // The chat PIN is single-sided: fetching a peer's key is never gated by the peer's
 // PIN. The current user unlocks the chat interface with their own PIN on the client
 // (verified via POST /api/user/verify-pin), so this simply returns the key.
-func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID) (string, *string, string, error) {
+func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID) (string, *string, string, *time.Time, error) {
 	var user models.User
 	if err := r.db.WithContext(ctx).
-		Select("username", "display_name", "public_key", "avatar_url").
+		Select("username", "display_name", "public_key", "avatar_url", "last_seen").
 		Where("user_id = ?", userID).
 		First(&user).Error; err != nil {
-		return "", nil, "", err
+		return "", nil, "", nil, err
 	}
 
 	if user.PublicKey == nil || *user.PublicKey == "" {
-		return "", nil, "", gorm.ErrRecordNotFound
+		return "", nil, "", nil, gorm.ErrRecordNotFound
 	}
-	return *user.PublicKey, user.AvatarURL, displayNameOf(&user), nil
+	return *user.PublicKey, user.AvatarURL, displayNameOf(&user), user.LastSeen, nil
 }
 
 // displayNameOf returns a user's display name, falling back to the username when
