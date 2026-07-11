@@ -40,26 +40,25 @@ type Handler struct {
 	googleOAuth *auth.GoogleOAuthConfig
 	broadcaster Broadcaster
 	// avatarDir is the filesystem directory uploaded avatars are written to; it is
-	// served publicly at "/uploads/avatars/" (see cmd/api/main.go). publicBaseURL is
-	// the origin prepended to the stored path so avatar_url is absolute — the client
-	// loads it directly from the backend, just like the Google-hosted photos.
-	avatarDir     string
-	publicBaseURL string
+	// served publicly at "/uploads/avatars/" (see cmd/api/main.go). The stored
+	// avatar_url is the backend-relative path under that route, not an absolute
+	// URL — the client prefixes its API origin, so the same value stays correct
+	// across dev/prod without a PUBLIC_BASE_URL to keep in sync.
+	avatarDir string
 }
 
 // NewHandler constructs an API handler with the required persistence and auth services.
 func NewHandler(postgres *db.PostgresRepo, dynamo *db.DynamoRepo, jwtManager *auth.JWTManager, googleCfg auth.GoogleOAuthConfig) *Handler {
 	cfgCopy := googleCfg
 	// UPLOAD_DIR is the root served at "/uploads"; avatars live in its "avatars"
-	// subdirectory. PUBLIC_BASE_URL is where the backend is reachable from browsers.
+	// subdirectory.
 	uploadDir := utils.GetEnv("UPLOAD_DIR", "./public/uploads")
 	return &Handler{
-		postgres:      postgres,
-		dynamo:        dynamo,
-		jwt:           jwtManager,
-		googleOAuth:   &cfgCopy,
-		avatarDir:     filepath.Join(uploadDir, "avatars"),
-		publicBaseURL: strings.TrimRight(utils.GetEnv("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
+		postgres:    postgres,
+		dynamo:      dynamo,
+		jwt:         jwtManager,
+		googleOAuth: &cfgCopy,
+		avatarDir:   filepath.Join(uploadDir, "avatars"),
 	}
 }
 
@@ -471,7 +470,9 @@ func (h *Handler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	avatarURL := h.publicBaseURL + "/uploads/avatars/" + filename
+	// Store a backend-relative path; the client prefixes its API origin when it
+	// loads the image. This keeps the value portable across environments.
+	avatarURL := "/uploads/avatars/" + filename
 	user, err := h.postgres.UpdateAvatarURL(r.Context(), userID, avatarURL)
 	if err != nil {
 		// Don't leave an orphaned file behind if the DB write fails.
