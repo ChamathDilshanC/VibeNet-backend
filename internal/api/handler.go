@@ -4,8 +4,11 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,6 +17,7 @@ import (
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/auth"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
+	"github.com/ChamathDilshanC/VibeNet-backend/pkg/utils"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
@@ -35,16 +39,27 @@ type Handler struct {
 	jwt         *auth.JWTManager
 	googleOAuth *auth.GoogleOAuthConfig
 	broadcaster Broadcaster
+	// avatarDir is the filesystem directory uploaded avatars are written to; it is
+	// served publicly at "/uploads/avatars/" (see cmd/api/main.go). publicBaseURL is
+	// the origin prepended to the stored path so avatar_url is absolute — the client
+	// loads it directly from the backend, just like the Google-hosted photos.
+	avatarDir     string
+	publicBaseURL string
 }
 
 // NewHandler constructs an API handler with the required persistence and auth services.
 func NewHandler(postgres *db.PostgresRepo, dynamo *db.DynamoRepo, jwtManager *auth.JWTManager, googleCfg auth.GoogleOAuthConfig) *Handler {
 	cfgCopy := googleCfg
+	// UPLOAD_DIR is the root served at "/uploads"; avatars live in its "avatars"
+	// subdirectory. PUBLIC_BASE_URL is where the backend is reachable from browsers.
+	uploadDir := utils.GetEnv("UPLOAD_DIR", "./public/uploads")
 	return &Handler{
-		postgres:    postgres,
-		dynamo:      dynamo,
-		jwt:         jwtManager,
-		googleOAuth: &cfgCopy,
+		postgres:      postgres,
+		dynamo:        dynamo,
+		jwt:           jwtManager,
+		googleOAuth:   &cfgCopy,
+		avatarDir:     filepath.Join(uploadDir, "avatars"),
+		publicBaseURL: strings.TrimRight(utils.GetEnv("PUBLIC_BASE_URL", "http://localhost:8080"), "/"),
 	}
 }
 
@@ -150,6 +165,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Use(h.JWTAuthMiddleware)
 			r.Get("/user/me", h.GetMe)
 			r.Put("/user/profile", h.UpdateProfile)
+			r.Post("/user/avatar", h.UploadAvatar)
 			r.Put("/user/public-key", h.UpdatePublicKey)
 			r.Put("/user/settings/pin-toggle", h.ToggleChatPIN)
 			r.Get("/user/my-pin", h.GetMyChatPIN)
@@ -372,6 +388,105 @@ func (h *Handler) broadcastUserUpdate(summary userSummary) {
 		return
 	}
 	h.broadcaster.Broadcast(payload)
+}
+
+// maxAvatarBytes caps an uploaded avatar. Profile pictures are small; the limit
+// keeps a hostile client from filling the disk or holding the request open.
+const maxAvatarBytes = 5 << 20 // 5 MiB
+
+// allowedAvatarTypes maps the content type sniffed from the file's bytes to the
+// extension we store it under. The extension is derived here, never taken from
+// the client-supplied filename, so a crafted name cannot inject a path or a
+// misleading type.
+var allowedAvatarTypes = map[string]string{
+	"image/jpeg": ".jpg",
+	"image/png":  ".png",
+	"image/webp": ".webp",
+	"image/gif":  ".gif",
+}
+
+// UploadAvatar accepts a multipart/form-data image under the "avatar" field,
+// stores it under a random UUID filename in the avatars directory, points the
+// user's avatar_url at the public URL, and broadcasts the change so every peer's
+// chat UI refreshes the picture live. It returns the updated profile summary.
+func (h *Handler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	// Cap the request body before parsing so an oversized upload is rejected
+	// without buffering it all into memory or disk.
+	r.Body = http.MaxBytesReader(w, r.Body, maxAvatarBytes)
+	if err := r.ParseMultipartForm(maxAvatarBytes); err != nil {
+		writeError(w, http.StatusBadRequest, "image is too large (max 5 MB) or the upload was malformed")
+		return
+	}
+
+	file, _, err := r.FormFile("avatar")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "no image file provided under the \"avatar\" field")
+		return
+	}
+	defer file.Close()
+
+	// Sniff the real content type from the first bytes rather than trusting the
+	// client's declared type or filename, then map it to an allowed extension.
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(file, head)
+	contentType := http.DetectContentType(head[:n])
+	ext, ok := allowedAvatarTypes[contentType]
+	if !ok {
+		writeError(w, http.StatusBadRequest, "unsupported image type; use JPEG, PNG, WebP, or GIF")
+		return
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read image")
+		return
+	}
+
+	if err := os.MkdirAll(h.avatarDir, 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to store image")
+		return
+	}
+	// The filename is a fresh UUID plus the vetted extension — no user input reaches
+	// the path, so there is nothing to traverse out of the avatars directory.
+	filename := uuid.NewString() + ext
+	dstPath := filepath.Join(h.avatarDir, filename)
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to store image")
+		return
+	}
+	if _, err := io.Copy(dst, file); err != nil {
+		dst.Close()
+		os.Remove(dstPath)
+		writeError(w, http.StatusInternalServerError, "failed to store image")
+		return
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(dstPath)
+		writeError(w, http.StatusInternalServerError, "failed to store image")
+		return
+	}
+
+	avatarURL := h.publicBaseURL + "/uploads/avatars/" + filename
+	user, err := h.postgres.UpdateAvatarURL(r.Context(), userID, avatarURL)
+	if err != nil {
+		// Don't leave an orphaned file behind if the DB write fails.
+		os.Remove(dstPath)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to update profile picture")
+		return
+	}
+
+	summary := toUserSummary(user)
+	h.broadcastUserUpdate(summary)
+	writeJSON(w, http.StatusOK, summary)
 }
 
 // usernamePattern is a superset of the character set auth.DeriveUsername

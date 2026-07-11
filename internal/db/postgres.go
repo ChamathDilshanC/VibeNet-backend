@@ -263,6 +263,24 @@ func isUniqueViolation(err error) bool {
 	return strings.Contains(msg, "duplicate") || strings.Contains(msg, "unique")
 }
 
+// UpdateAvatarURL sets the user's profile picture URL after an avatar upload and
+// returns the refreshed record so the caller can broadcast and echo back the full
+// profile. A missing user yields gorm.ErrRecordNotFound.
+func (r *PostgresRepo) UpdateAvatarURL(ctx context.Context, userID uuid.UUID, avatarURL string) (*models.User, error) {
+	result := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("avatar_url", avatarURL)
+	if result.Error != nil {
+		return nil, fmt.Errorf("update avatar url: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		// Each upload writes a fresh UUID URL, so an unchanged value never happens
+		// here — zero rows means the user is gone.
+		return nil, gorm.ErrRecordNotFound
+	}
+	return r.GetUserByID(ctx, userID)
+}
+
 // UpdatePublicKey persists a user's E2EE public key after OAuth login or key rotation.
 func (r *PostgresRepo) UpdatePublicKey(ctx context.Context, userID uuid.UUID, publicKey string) error {
 	result := r.db.WithContext(ctx).Model(&models.User{}).

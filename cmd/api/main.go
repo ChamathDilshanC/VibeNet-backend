@@ -174,6 +174,13 @@ func main() {
 	})
 
 	apiHandler.RegisterRoutes(router)
+
+	// Serve uploaded files (currently avatars) from disk. UPLOAD_DIR is the root the
+	// /uploads path maps to; the avatar handler writes into its "avatars" subdir and
+	// returns URLs under this prefix. Kept in sync with NewHandler's UPLOAD_DIR read.
+	uploadDir := utils.GetEnv("UPLOAD_DIR", "./public/uploads")
+	router.Handle("/uploads/*", http.StripPrefix("/uploads/", http.FileServer(http.Dir(uploadDir))))
+
 	router.Get("/ws", wsHandler.ServeHTTP)
 
 	port := utils.GetEnv("APP_PORT", "8080")

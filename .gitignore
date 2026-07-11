@@ -31,3 +31,7 @@ keys/
 Thumbs.db
 
 .env
+
+# Uploaded user content (avatars). Ignore the files, keep the directory via .gitkeep.
+/public/uploads/avatars/*
+!/public/uploads/avatars/.gitkeep
