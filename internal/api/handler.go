@@ -186,6 +186,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Get("/user/my-pin", h.GetMyChatPIN)
 			r.Get("/users/search", h.SearchUsers)
 			r.Get("/users/{id}/key", h.GetUserPublicKey)
+			r.Post("/users/{id}/verify-pin", h.VerifyPeerPin)
 			r.Get("/messages/{chatRoomID}", h.GetChatHistory)
 		})
 	})
@@ -670,6 +671,50 @@ func (h *Handler) VerifyPin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !pin.Valid(user, strings.TrimSpace(req.PIN)) {
+		writeError(w, http.StatusForbidden, "incorrect PIN")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"valid": true})
+}
+
+// VerifyPeerPin checks a PIN the authenticated caller entered against a TARGET
+// user's active chat-PIN profile — the anti-spam gate a recipient sets so only
+// people they've shared their code with can start a conversation with them (see
+// package pin). Distinct from VerifyPin, which validates the caller's OWN PIN.
+// Returns 200 {"valid":true} on success, 403 on a wrong PIN. When the target has
+// the PIN disabled there is nothing to check, so it succeeds. The target's actual
+// PIN is never returned. Requires authentication so anonymous callers can't probe
+// arbitrary users' PINs.
+func (h *Handler) VerifyPeerPin(w http.ResponseWriter, r *http.Request) {
+	if _, ok := UserIDFromContext(r.Context()); !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	targetID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+
+	var req pinVerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	target, err := h.postgres.GetUserByID(r.Context(), targetID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify pin")
+		return
+	}
+
+	if !pin.Valid(target, strings.TrimSpace(req.PIN)) {
 		writeError(w, http.StatusForbidden, "incorrect PIN")
 		return
 	}

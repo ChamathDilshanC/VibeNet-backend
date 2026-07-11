@@ -282,6 +282,13 @@ server {
     listen 80;
     server_name api.yourdomain.com;
 
+    # Avatar uploads 5 MiB දක්වා multipart bodies (internal/api/handler.go එකේ
+    # maxAvatarBytes බලන්න). nginx default cap එක 1 MB නිසා, මේක නැතුව හරි
+    # photos 413 එකක් එක්ක Go එකට යන්න කලින්ම reject වෙනවා — ඒ 413 error page
+    # එකේ CORS headers නෑ, ඒ නිසා browser එක ඒක CORS error එකක් විදියට පෙන්නනවා.
+    # මේක Go limit එකට සමානව හෝ වැඩියෙන් තියන්න.
+    client_max_body_size 6m;
+
     location / {
         proxy_pass http://localhost:8080;
         proxy_http_version 1.1;
@@ -306,6 +313,8 @@ sudo certbot --nginx -d api.yourdomain.com
 මුලින්ම domain එකේ **A record** එක EC2 public IP එකට point කරන්න. ඊට පස්සෙ security group එකේ port `8080` වහලා, `80`/`443` විතරක් තියන්න.
 
 > 🔌 **WebSocket satahan:** උඩ තියෙන `proxy_set_header Upgrade`/`Connection` lines **අත්‍යවශ්‍යයි** — ඒවා නැතුව `/ws` chat endpoint එක nginx පිටිපස්සෙ වැඩ කරන්නෙ නෑ.
+
+> 📤 **Upload-size satahan:** avatar uploads වලට `client_max_body_size 6m;` line එක **අත්‍යවශ්‍යයි**. nginx default 1 MB limit එකෙන් ලොකු multipart bodies `413` එකක් එක්ක reject කරනවා, ඒ error page එකේ CORS headers නැති නිසා browser එකේ CORS error එකක් විදියට පෙන්නනවා. දැනටමත් nginx run වෙනවා නම්, මේ line එක තියෙන `/etc/nginx/sites-available/vibenet` එකට add කරලා `sudo nginx -t && sudo systemctl reload nginx` run කරන්න.
 
 ---
 

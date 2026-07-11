@@ -282,6 +282,15 @@ server {
     listen 80;
     server_name api.yourdomain.com;
 
+    # Avatar uploads are multipart bodies up to 5 MiB (see maxAvatarBytes in
+    # internal/api/handler.go). nginx's default cap is 1 MB, so without this it
+    # rejects real photos with a 413 *before* they reach Go — and that 413 error
+    # page carries no CORS headers, so the browser misreports it as a CORS error
+    # ("No 'Access-Control-Allow-Origin' header is present"). Keep this at or
+    # above the Go limit; the small headroom lets Go return its own JSON error
+    # (which does include CORS headers) for anything genuinely oversize.
+    client_max_body_size 6m;
+
     location / {
         proxy_pass http://localhost:8080;
         proxy_http_version 1.1;
@@ -306,6 +315,8 @@ sudo certbot --nginx -d api.yourdomain.com
 Point your domain's **A record** at the EC2 public IP first. After this, close port `8080` in the security group and keep only `80`/`443`.
 
 > 🔌 **WebSocket note:** the `proxy_set_header Upgrade`/`Connection` lines above are **required** — without them the `/ws` chat endpoint will not work behind nginx.
+
+> 📤 **Upload-size note:** the `client_max_body_size 6m;` line is **required** for avatar uploads. nginx defaults to a 1 MB limit and rejects larger multipart bodies with a `413` whose error page has no CORS headers, so the browser surfaces it as a misleading CORS error. If you already have a running nginx, add this line to the existing `/etc/nginx/sites-available/vibenet` and run `sudo nginx -t && sudo systemctl reload nginx`.
 
 ---
 
