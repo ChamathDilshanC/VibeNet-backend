@@ -84,11 +84,17 @@ func (h *Handler) GoogleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	username := auth.DeriveUsername(profile.Name, profile.Email)
-	user, err := h.postgres.CreateOrGetUserByGoogle(r.Context(), profile.ID, profile.Email, username, profile.Picture)
+	// The Google account name is the natural "real name" seed; fall back to the
+	// derived username when Google gives us no name. The user can edit it later.
+	displayName := strings.TrimSpace(profile.Name)
+	if displayName == "" {
+		displayName = username
+	}
+	user, err := h.postgres.CreateOrGetUserByGoogle(r.Context(), profile.ID, profile.Email, username, displayName, profile.Picture)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "duplicate") || strings.Contains(strings.ToLower(err.Error()), "unique") {
 			username = fmt.Sprintf("%s_%s", username, profile.ID[:8])
-			user, err = h.postgres.CreateOrGetUserByGoogle(r.Context(), profile.ID, profile.Email, username, profile.Picture)
+			user, err = h.postgres.CreateOrGetUserByGoogle(r.Context(), profile.ID, profile.Email, username, displayName, profile.Picture)
 		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to provision google user")

@@ -18,6 +18,12 @@ import (
 type User struct {
 	UserID       uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"user_id"`
 	Username     string    `gorm:"type:varchar(64);uniqueIndex;not null" json:"username"`
+	// DisplayName is the human "real name" shown throughout the client in place
+	// of the login username. Seeded at sign-up (the username for password
+	// accounts, the Google account name for OAuth) and fully editable in profile
+	// settings. It carries no uniqueness constraint — two people may share a real
+	// name. Clients fall back to Username when it is empty (see toUserSummary).
+	DisplayName  string    `gorm:"type:varchar(64);not null;default:''" json:"display_name"`
 	Email        *string   `gorm:"type:varchar(255);uniqueIndex" json:"email,omitempty"`
 	GoogleID     *string   `gorm:"type:varchar(255);uniqueIndex" json:"-"`
 	PasswordHash *string   `gorm:"type:text" json:"-"`

@@ -64,12 +64,19 @@ func extractBearerToken(r *http.Request) string {
 }
 
 func toUserSummary(user *models.User) userSummary {
+	displayName := user.DisplayName
+	if strings.TrimSpace(displayName) == "" {
+		// Rows created before display_name existed carry an empty value; fall back
+		// to the username so the client always has a name to render.
+		displayName = user.Username
+	}
 	return userSummary{
-		UserID:    user.UserID.String(),
-		Username:  user.Username,
-		Email:     user.Email,
-		PublicKey: user.PublicKey,
-		AvatarURL: user.AvatarURL,
+		UserID:      user.UserID.String(),
+		Username:    user.Username,
+		DisplayName: displayName,
+		Email:       user.Email,
+		PublicKey:   user.PublicKey,
+		AvatarURL:   user.AvatarURL,
 	}
 }
 

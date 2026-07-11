@@ -64,6 +64,9 @@ func main() {
 
 	apiHandler := api.NewHandler(postgresRepo, dynamoRepo, jwtManager, googleCfg)
 	wsHub := websocket.NewHub()
+	// Let the REST layer push live profile updates (user_update) to connected
+	// clients. Wired after construction to avoid an api⇄websocket import cycle.
+	apiHandler.SetBroadcaster(wsHub)
 	wsHandler := websocket.NewHandler(wsHub, apiHandler, dynamoRepo)
 
 	router := chi.NewRouter()

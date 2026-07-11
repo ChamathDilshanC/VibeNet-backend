@@ -13,11 +13,20 @@ import (
 
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/auth"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
+
+// Broadcaster delivers a pre-marshalled frame to every connected WebSocket
+// client. The websocket Hub satisfies it; it is declared here as an interface so
+// the api package can push live updates without importing websocket (which would
+// be a cycle — websocket already imports api). Injected via SetBroadcaster.
+type Broadcaster interface {
+	Broadcast(payload []byte)
+}
 
 // Handler groups REST dependencies for auth and user routes.
 type Handler struct {
@@ -25,6 +34,7 @@ type Handler struct {
 	dynamo      *db.DynamoRepo
 	jwt         *auth.JWTManager
 	googleOAuth *auth.GoogleOAuthConfig
+	broadcaster Broadcaster
 }
 
 // NewHandler constructs an API handler with the required persistence and auth services.
@@ -36,6 +46,13 @@ func NewHandler(postgres *db.PostgresRepo, dynamo *db.DynamoRepo, jwtManager *au
 		jwt:         jwtManager,
 		googleOAuth: &cfgCopy,
 	}
+}
+
+// SetBroadcaster wires in the WebSocket hub after construction, breaking the
+// otherwise-circular dependency between the api and websocket packages. Safe to
+// leave unset (e.g. in tests): broadcasts are then skipped.
+func (h *Handler) SetBroadcaster(b Broadcaster) {
+	h.broadcaster = b
 }
 
 type registerRequest struct {
@@ -59,21 +76,35 @@ type authResponse struct {
 }
 
 type userSummary struct {
-	UserID    string  `json:"user_id"`
-	Username  string  `json:"username"`
-	Email     *string `json:"email,omitempty"`
-	PublicKey *string `json:"public_key,omitempty"`
-	AvatarURL *string `json:"avatar_url,omitempty"`
+	UserID      string  `json:"user_id"`
+	Username    string  `json:"username"`
+	DisplayName string  `json:"display_name"`
+	Email       *string `json:"email,omitempty"`
+	PublicKey   *string `json:"public_key,omitempty"`
+	AvatarURL   *string `json:"avatar_url,omitempty"`
 }
 
 type profileUpdateRequest struct {
-	Username string `json:"username"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
 }
 
 type publicKeyResponse struct {
-	UserID    string  `json:"user_id"`
-	PublicKey string  `json:"public_key"`
-	AvatarURL *string `json:"avatar_url,omitempty"`
+	UserID      string  `json:"user_id"`
+	DisplayName string  `json:"display_name"`
+	PublicKey   string  `json:"public_key"`
+	AvatarURL   *string `json:"avatar_url,omitempty"`
+}
+
+// userUpdateBroadcast is pushed to every connected client when a user edits
+// their profile, so peers update the name/avatar they show mid-chat without a
+// reload. It carries no ciphertext — purely public profile fields.
+type userUpdateBroadcast struct {
+	Type        string  `json:"type"`
+	UserID      string  `json:"user_id"`
+	Username    string  `json:"username"`
+	DisplayName string  `json:"display_name"`
+	AvatarURL   *string `json:"avatar_url,omitempty"`
 }
 
 type pinToggleRequest struct {
@@ -91,10 +122,11 @@ type chatPINResponse struct {
 
 // userSearchResult exposes only discovery-safe fields — the actual PIN is never returned.
 type userSearchResult struct {
-	UserID     string  `json:"user_id"`
-	Username   string  `json:"username"`
-	RequirePIN bool    `json:"require_pin"`
-	AvatarURL  *string `json:"avatar_url,omitempty"`
+	UserID      string  `json:"user_id"`
+	Username    string  `json:"username"`
+	DisplayName string  `json:"display_name"`
+	RequirePIN  bool    `json:"require_pin"`
+	AvatarURL   *string `json:"avatar_url,omitempty"`
 }
 
 type errorResponse struct {
@@ -241,8 +273,13 @@ func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toUserSummary(user))
 }
 
-// UpdateProfile renames the authenticated user. The username doubles as the
-// display name across the client, so this is the profile edit surface.
+// UpdateProfile edits the authenticated user's login username and display name
+// (the "real name" shown throughout the client). Username uniqueness is enforced
+// case-insensitively; the display name has no such constraint. A blank display
+// name falls back to the username so the account always has a usable label.
+//
+// On success it broadcasts a user_update frame to every connected client so
+// peers refresh the name/avatar they show without a reload.
 //
 // The issued JWT still carries the old username in its claims; nothing on the
 // server reads that claim (authorization is by user_id), and the token stays
@@ -260,13 +297,24 @@ func (h *Handler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	req.DisplayName = strings.TrimSpace(req.DisplayName)
+	if err := validateDisplayName(req.DisplayName); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// An omitted/blank real name defaults to the username rather than storing an
+	// empty label — mirrors the seed behaviour at sign-up.
+	if req.DisplayName == "" {
+		req.DisplayName = req.Username
+	}
+
 	userID, ok := UserIDFromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	user, err := h.postgres.UpdateProfile(r.Context(), userID, req.Username)
+	user, err := h.postgres.UpdateProfile(r.Context(), userID, req.Username, req.DisplayName)
 	if err != nil {
 		switch {
 		case errors.Is(err, db.ErrUsernameTaken):
@@ -279,7 +327,29 @@ func (h *Handler) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, toUserSummary(user))
+	summary := toUserSummary(user)
+	h.broadcastUserUpdate(summary)
+	writeJSON(w, http.StatusOK, summary)
+}
+
+// broadcastUserUpdate pushes the updated public profile to all connected clients.
+// Best-effort and non-blocking (see Hub.Broadcast); a nil broadcaster (unset in
+// tests) or a marshal error simply skips the notification.
+func (h *Handler) broadcastUserUpdate(summary userSummary) {
+	if h.broadcaster == nil {
+		return
+	}
+	payload, err := json.Marshal(userUpdateBroadcast{
+		Type:        "user_update",
+		UserID:      summary.UserID,
+		Username:    summary.Username,
+		DisplayName: summary.DisplayName,
+		AvatarURL:   summary.AvatarURL,
+	})
+	if err != nil {
+		return
+	}
+	h.broadcaster.Broadcast(payload)
 }
 
 // usernamePattern is a superset of the character set auth.DeriveUsername
@@ -299,6 +369,27 @@ func validateUsername(username string) error {
 		return errors.New("username may only contain letters, numbers, dots, and underscores")
 	}
 	return nil
+}
+
+// validateDisplayName bounds the free-form "real name". Unlike the username it
+// allows spaces and mixed case (it is a human name, not a handle) but is capped
+// to the column width. An empty value is accepted here and defaulted by the
+// caller to the username.
+func validateDisplayName(displayName string) error {
+	if len(displayName) > 64 {
+		return errors.New("real name must be at most 64 characters")
+	}
+	return nil
+}
+
+// displayNameOfUser returns a user's display name, falling back to the username
+// when none is set (rows predating the column). Keeps every name a client sees
+// non-empty, matching toUserSummary's fallback.
+func displayNameOfUser(user *models.User) string {
+	if strings.TrimSpace(user.DisplayName) != "" {
+		return user.DisplayName
+	}
+	return user.Username
 }
 
 // UpdatePublicKey stores or updates the authenticated user's E2EE public key.
@@ -348,7 +439,7 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 
 	providedPIN := strings.TrimSpace(r.URL.Query().Get("pin"))
 
-	publicKey, avatarURL, err := h.postgres.GetPublicKey(r.Context(), userID, providedPIN)
+	publicKey, avatarURL, displayName, err := h.postgres.GetPublicKey(r.Context(), userID, providedPIN)
 	if err != nil {
 		switch {
 		case errors.Is(err, db.ErrChatPINRequired):
@@ -364,9 +455,10 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, publicKeyResponse{
-		UserID:    userID.String(),
-		PublicKey: publicKey,
-		AvatarURL: avatarURL,
+		UserID:      userID.String(),
+		DisplayName: displayName,
+		PublicKey:   publicKey,
+		AvatarURL:   avatarURL,
 	})
 }
 
@@ -437,10 +529,11 @@ func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 	results := make([]userSearchResult, 0, len(users))
 	for i := range users {
 		results = append(results, userSearchResult{
-			UserID:     users[i].UserID.String(),
-			Username:   users[i].Username,
-			RequirePIN: users[i].RequireChatPIN,
-			AvatarURL:  users[i].AvatarURL,
+			UserID:      users[i].UserID.String(),
+			Username:    users[i].Username,
+			DisplayName: displayNameOfUser(&users[i]),
+			RequirePIN:  users[i].RequireChatPIN,
+			AvatarURL:   users[i].AvatarURL,
 		})
 	}
 

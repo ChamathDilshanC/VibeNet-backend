@@ -91,6 +91,22 @@ func (h *Hub) DeliverToUser(receiverID uuid.UUID, payload []byte) bool {
 	}
 }
 
+// Broadcast queues a payload to every currently connected client, best-effort.
+// Used for profile updates (user_update) that all peers should pick up live. A
+// client whose send buffer is full has the frame dropped rather than blocking
+// the hub — the update is non-critical and clients also refresh on next fetch.
+func (h *Hub) Broadcast(payload []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, client := range h.clients {
+		select {
+		case client.send <- payload:
+		default:
+			log.Printf("websocket: broadcast drop — send buffer full for user %s", client.userID)
+		}
+	}
+}
+
 // IsOnline reports whether a user currently has an active WebSocket connection.
 func (h *Hub) IsOnline(userID uuid.UUID) bool {
 	h.mu.RLock()

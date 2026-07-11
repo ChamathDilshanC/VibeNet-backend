@@ -103,7 +103,10 @@ func NewPostgresRepo(database *gorm.DB) *PostgresRepo {
 // CreateUser inserts a new standard-registration user with a bcrypt password hash and E2EE public key.
 func (r *PostgresRepo) CreateUser(ctx context.Context, username, passwordHash, publicKey string, email *string) (*models.User, error) {
 	user := &models.User{
-		Username:     username,
+		Username: username,
+		// Password accounts have no external "real name" source, so the username
+		// doubles as the initial display name. It stays fully editable in settings.
+		DisplayName:  username,
 		Email:        email,
 		PasswordHash: &passwordHash,
 		PublicKey:    &publicKey,
@@ -122,7 +125,7 @@ func (r *PostgresRepo) CreateUser(ctx context.Context, username, passwordHash, p
 // differs from what we hold, so a photo changed in Google shows up after the next sign-in.
 // The username is only used when provisioning: renaming in Google must not silently
 // overwrite a username the person later chose in VibeNet's profile settings.
-func (r *PostgresRepo) CreateOrGetUserByGoogle(ctx context.Context, googleID, email, username, avatarURL string) (*models.User, error) {
+func (r *PostgresRepo) CreateOrGetUserByGoogle(ctx context.Context, googleID, email, username, displayName, avatarURL string) (*models.User, error) {
 	var existing models.User
 	err := r.db.WithContext(ctx).Where("google_id = ?", googleID).First(&existing).Error
 	if err == nil {
@@ -135,6 +138,17 @@ func (r *PostgresRepo) CreateOrGetUserByGoogle(ctx context.Context, googleID, em
 				existing.AvatarURL = &avatarURL
 			}
 		}
+		// Backfill a missing display name (e.g. accounts created before this
+		// column existed) from the Google name, but never overwrite one the
+		// person has since set — renaming in Google must not clobber it.
+		if existing.DisplayName == "" && displayName != "" {
+			if err := r.db.WithContext(ctx).Model(&existing).
+				Update("display_name", displayName).Error; err != nil {
+				log.Printf("backfill display name for %s: %v", existing.UserID, err)
+			} else {
+				existing.DisplayName = displayName
+			}
+		}
 		return &existing, nil
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -144,9 +158,10 @@ func (r *PostgresRepo) CreateOrGetUserByGoogle(ctx context.Context, googleID, em
 	emailCopy := email
 	googleIDCopy := googleID
 	user := &models.User{
-		Username: username,
-		Email:    &emailCopy,
-		GoogleID: &googleIDCopy,
+		Username:    username,
+		DisplayName: displayName,
+		Email:       &emailCopy,
+		GoogleID:    &googleIDCopy,
 	}
 	if avatarURL != "" {
 		avatarCopy := avatarURL
@@ -167,7 +182,7 @@ func (r *PostgresRepo) CreateOrGetUserByGoogle(ctx context.Context, googleID, em
 // username search (SearchUsersByUsername) and blocks look-alike impersonation
 // that the case-sensitive DB unique index alone would let through. The index
 // remains as a race backstop between this check and the write.
-func (r *PostgresRepo) UpdateProfile(ctx context.Context, userID uuid.UUID, username string) (*models.User, error) {
+func (r *PostgresRepo) UpdateProfile(ctx context.Context, userID uuid.UUID, username, displayName string) (*models.User, error) {
 	var conflicts int64
 	if err := r.db.WithContext(ctx).Model(&models.User{}).
 		Where("LOWER(username) = LOWER(?) AND user_id <> ?", username, userID).
@@ -178,9 +193,15 @@ func (r *PostgresRepo) UpdateProfile(ctx context.Context, userID uuid.UUID, user
 		return nil, ErrUsernameTaken
 	}
 
+	// Username and display name move together in a single write. display_name has
+	// no uniqueness constraint, so only the username can collide (guarded above +
+	// the unique-index backstop below).
 	result := r.db.WithContext(ctx).Model(&models.User{}).
 		Where("user_id = ?", userID).
-		Update("username", username)
+		Updates(map[string]interface{}{
+			"username":     username,
+			"display_name": displayName,
+		})
 	if result.Error != nil {
 		if isUniqueViolation(result.Error) {
 			return nil, ErrUsernameTaken
@@ -240,25 +261,36 @@ func (r *PostgresRepo) GetUserByID(ctx context.Context, userID uuid.UUID) (*mode
 // caller must supply the current 4-digit providedPIN. The PIN is validated against the
 // stored value and its expiry; a missing, incorrect, or expired PIN yields
 // ErrChatPINRequired so the API layer can respond with 403 Forbidden.
-func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID, providedPIN string) (string, *string, error) {
+func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID, providedPIN string) (string, *string, string, error) {
 	var user models.User
 	if err := r.db.WithContext(ctx).
-		Select("public_key", "avatar_url", "require_chat_pin", "chat_pin", "chat_pin_expiry").
+		Select("username", "display_name", "public_key", "avatar_url", "require_chat_pin", "chat_pin", "chat_pin_expiry").
 		Where("user_id = ?", userID).
 		First(&user).Error; err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
 
 	if user.RequireChatPIN {
 		if providedPIN == "" || providedPIN != user.ChatPIN || !time.Now().Before(user.ChatPINExpiry) {
-			return "", nil, ErrChatPINRequired
+			return "", nil, "", ErrChatPINRequired
 		}
 	}
 
 	if user.PublicKey == nil || *user.PublicKey == "" {
-		return "", nil, gorm.ErrRecordNotFound
+		return "", nil, "", gorm.ErrRecordNotFound
 	}
-	return *user.PublicKey, user.AvatarURL, nil
+	return *user.PublicKey, user.AvatarURL, displayNameOf(&user), nil
+}
+
+// displayNameOf returns a user's display name, falling back to the username when
+// none has been set (e.g. rows predating the display_name column). Every caller
+// that surfaces a name to a client should route through this so the UI never
+// shows an empty label.
+func displayNameOf(user *models.User) string {
+	if strings.TrimSpace(user.DisplayName) != "" {
+		return user.DisplayName
+	}
+	return user.Username
 }
 
 // ToggleChatPIN enables or disables the anti-spam chat-initiation PIN requirement for a user.
