@@ -12,9 +12,11 @@ import (
 // a password and initially omit a public key until the client generates E2EE keys.
 // The server never stores or receives private keys.
 //
-// Anti-spam rotating PIN: when RequireChatPIN is enabled, strangers must supply a
-// valid, unexpired 4-digit ChatPIN before they can fetch this user's public key
-// and initiate a chat. ChatPIN and ChatPINExpiry are never serialized to clients.
+// Anti-spam chat PIN: when ChatPinEnabled is true, a stranger must supply a valid
+// 6-digit PIN before they can fetch this user's public key and initiate a chat.
+// The PIN is either a "rotating" code (deterministically derived from the user and
+// the current 5-minute window — see internal/pin) or a "static" CustomPin the user
+// sets. CustomPin is never serialized to clients.
 type User struct {
 	UserID   uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"user_id"`
 	Username string    `gorm:"type:varchar(64);uniqueIndex;not null" json:"username"`
@@ -41,13 +43,24 @@ type User struct {
 	// initials rendered client-side.
 	AvatarURL *string `gorm:"type:text" json:"avatar_url,omitempty"`
 
-	// RequireChatPIN gates public-key retrieval behind a rotating PIN when true.
-	RequireChatPIN bool `gorm:"not null;default:false" json:"require_chat_pin"`
-	// ChatPIN is the current 4-digit numeric PIN; empty when none has been issued.
-	ChatPIN string `gorm:"type:varchar(4)" json:"-"`
-	// ChatPINExpiry marks when the current ChatPIN stops being valid (issue time + 5m).
-	ChatPINExpiry time.Time `json:"-"`
+	// ChatPinEnabled gates public-key retrieval behind a chat PIN when true. New
+	// accounts default to true (set explicitly at registration — see CreateUser —
+	// because GORM can't distinguish an unset bool from a deliberate false).
+	ChatPinEnabled bool `gorm:"not null;default:true" json:"chat_pin_enabled"`
+	// ChatPinType selects how the required PIN is derived: "rotating" (a code that
+	// changes every 5 minutes) or "static" (the user's CustomPin). Defaults to
+	// "rotating".
+	ChatPinType string `gorm:"type:varchar(16);not null;default:'rotating'" json:"chat_pin_type"`
+	// CustomPin is the user's chosen 6-digit static PIN, used only when
+	// ChatPinType is "static". Nil until the user sets one. Never serialized.
+	CustomPin *string `gorm:"type:varchar(6)" json:"-"`
 }
+
+// Chat PIN type values for ChatPinType.
+const (
+	ChatPinRotating = "rotating"
+	ChatPinStatic   = "static"
+)
 
 // TableName overrides the default GORM table name for the User model.
 func (User) TableName() string {

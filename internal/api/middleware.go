@@ -71,13 +71,15 @@ func toUserSummary(user *models.User) userSummary {
 		displayName = user.Username
 	}
 	return userSummary{
-		UserID:      user.UserID.String(),
-		Username:    user.Username,
-		DisplayName: displayName,
-		Email:       user.Email,
-		PhoneNumber: user.PhoneNumber,
-		PublicKey:   user.PublicKey,
-		AvatarURL:   user.AvatarURL,
+		UserID:         user.UserID.String(),
+		Username:       user.Username,
+		DisplayName:    displayName,
+		Email:          user.Email,
+		PhoneNumber:    user.PhoneNumber,
+		PublicKey:      user.PublicKey,
+		AvatarURL:      user.AvatarURL,
+		ChatPinEnabled: user.ChatPinEnabled,
+		ChatPinType:    user.ChatPinType,
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/auth"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/pin"
 	"github.com/ChamathDilshanC/VibeNet-backend/pkg/utils"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -92,13 +93,15 @@ type authResponse struct {
 }
 
 type userSummary struct {
-	UserID      string  `json:"user_id"`
-	Username    string  `json:"username"`
-	DisplayName string  `json:"display_name"`
-	Email       *string `json:"email,omitempty"`
-	PhoneNumber *string `json:"phone_number,omitempty"`
-	PublicKey   *string `json:"public_key,omitempty"`
-	AvatarURL   *string `json:"avatar_url,omitempty"`
+	UserID         string  `json:"user_id"`
+	Username       string  `json:"username"`
+	DisplayName    string  `json:"display_name"`
+	Email          *string `json:"email,omitempty"`
+	PhoneNumber    *string `json:"phone_number,omitempty"`
+	PublicKey      *string `json:"public_key,omitempty"`
+	AvatarURL      *string `json:"avatar_url,omitempty"`
+	ChatPinEnabled bool    `json:"chat_pin_enabled"`
+	ChatPinType    string  `json:"chat_pin_type"`
 }
 
 type profileUpdateRequest struct {
@@ -124,26 +127,32 @@ type userUpdateBroadcast struct {
 	AvatarURL   *string `json:"avatar_url,omitempty"`
 }
 
-type pinToggleRequest struct {
-	RequirePIN bool `json:"require_pin"`
+// pinSettingsRequest is the body of PUT /api/user/settings/pin. CustomPin is only
+// read when Type is "static"; it may be omitted to keep an existing custom PIN.
+type pinSettingsRequest struct {
+	Enabled   bool    `json:"enabled"`
+	Type      string  `json:"type"`
+	CustomPin *string `json:"custom_pin,omitempty"`
 }
 
-type pinToggleResponse struct {
-	RequirePIN bool `json:"require_pin"`
-}
-
-type chatPINResponse struct {
-	PIN       string    `json:"pin"`
-	ExpiresAt time.Time `json:"expires_at"`
+// pinStatusResponse describes the owner's current chat-PIN state and the code they
+// should share right now. PIN is empty when protection is disabled, or when "static"
+// is selected but no custom PIN has been set. ExpiresAt is set only for rotating
+// codes (when the current 5-minute window ends).
+type pinStatusResponse struct {
+	Enabled   bool       `json:"enabled"`
+	Type      string     `json:"type"`
+	PIN       string     `json:"pin"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // userSearchResult exposes only discovery-safe fields — the actual PIN is never returned.
 type userSearchResult struct {
-	UserID      string  `json:"user_id"`
-	Username    string  `json:"username"`
-	DisplayName string  `json:"display_name"`
-	RequirePIN  bool    `json:"require_pin"`
-	AvatarURL   *string `json:"avatar_url,omitempty"`
+	UserID         string  `json:"user_id"`
+	Username       string  `json:"username"`
+	DisplayName    string  `json:"display_name"`
+	ChatPinEnabled bool    `json:"chat_pin_enabled"`
+	AvatarURL      *string `json:"avatar_url,omitempty"`
 }
 
 type errorResponse struct {
@@ -166,7 +175,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Put("/user/profile", h.UpdateProfile)
 			r.Post("/user/avatar", h.UploadAvatar)
 			r.Put("/user/public-key", h.UpdatePublicKey)
-			r.Put("/user/settings/pin-toggle", h.ToggleChatPIN)
+			r.Put("/user/settings/pin", h.UpdatePinSettings)
 			r.Get("/user/my-pin", h.GetMyChatPIN)
 			r.Get("/users/search", h.SearchUsers)
 			r.Get("/users/{id}/key", h.GetUserPublicKey)
@@ -541,6 +550,9 @@ func validatePhoneNumber(phone string) error {
 // "+1 (555) 010-1234" or "+15550101234" collides in the unique index.
 var phoneSeparators = regexp.MustCompile(`[\s().-]`)
 
+// sixDigitPattern matches a 6-digit static chat PIN.
+var sixDigitPattern = regexp.MustCompile(`^[0-9]{6}$`)
+
 // validateDisplayName bounds the free-form "real name". Unlike the username it
 // allows spaces and mixed case (it is a human name, not a handle) but is capped
 // to the column width. An empty value is accepted here and defaulted by the
@@ -632,10 +644,12 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ToggleChatPIN enables or disables the authenticated user's anti-spam chat PIN requirement.
-// Expects JSON body {"require_pin": true|false}.
-func (h *Handler) ToggleChatPIN(w http.ResponseWriter, r *http.Request) {
-	var req pinToggleRequest
+// UpdatePinSettings persists the authenticated user's chat-PIN configuration:
+// whether it's enabled, the type ("rotating" or "static"), and — for the static
+// type — a 6-digit custom PIN. Expects JSON {"enabled":bool,"type":string,"custom_pin":string?}.
+// Responds with the resulting pinStatusResponse (the same shape as GET /user/my-pin).
+func (h *Handler) UpdatePinSettings(w http.ResponseWriter, r *http.Request) {
+	var req pinSettingsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
@@ -647,20 +661,49 @@ func (h *Handler) ToggleChatPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.postgres.ToggleChatPIN(r.Context(), userID, req.RequirePIN); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			writeError(w, http.StatusNotFound, "user not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to update pin setting")
+	req.Type = strings.TrimSpace(req.Type)
+	if req.Type != models.ChatPinRotating && req.Type != models.ChatPinStatic {
+		writeError(w, http.StatusBadRequest, `type must be "rotating" or "static"`)
 		return
 	}
 
-	writeJSON(w, http.StatusOK, pinToggleResponse{RequirePIN: req.RequirePIN})
+	// For the static type, a supplied custom PIN must be exactly 6 digits. It may be
+	// omitted to keep a previously-set PIN, but never left unset on first use.
+	var customPin *string
+	if req.Type == models.ChatPinStatic && req.CustomPin != nil {
+		trimmed := strings.TrimSpace(*req.CustomPin)
+		if !sixDigitPattern.MatchString(trimmed) {
+			writeError(w, http.StatusBadRequest, "custom PIN must be exactly 6 digits")
+			return
+		}
+		customPin = &trimmed
+	}
+
+	user, err := h.postgres.UpdatePinSettings(r.Context(), userID, req.Enabled, req.Type, customPin)
+	if err != nil {
+		switch {
+		case errors.Is(err, db.ErrInvalidPinType):
+			writeError(w, http.StatusBadRequest, `type must be "rotating" or "static"`)
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			writeError(w, http.StatusNotFound, "user not found")
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to update pin settings")
+		}
+		return
+	}
+
+	// Guard against selecting static with no PIN ever set.
+	if user.ChatPinEnabled && user.ChatPinType == models.ChatPinStatic &&
+		(user.CustomPin == nil || *user.CustomPin == "") {
+		writeError(w, http.StatusBadRequest, "set a 6-digit custom PIN to use a static code")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, pinStatusFor(user))
 }
 
-// GetMyChatPIN returns the authenticated user's currently active 4-digit PIN, generating a
-// fresh one when none exists or the previous PIN has expired.
+// GetMyChatPIN returns the authenticated user's current chat-PIN status and the code
+// they should share right now — the static custom PIN, or the active rotating code.
 func (h *Handler) GetMyChatPIN(w http.ResponseWriter, r *http.Request) {
 	userID, ok := UserIDFromContext(r.Context())
 	if !ok {
@@ -668,7 +711,7 @@ func (h *Handler) GetMyChatPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pin, expiry, err := h.postgres.GetOrRefreshChatPIN(r.Context(), userID)
+	user, err := h.postgres.GetUserByID(r.Context(), userID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			writeError(w, http.StatusNotFound, "user not found")
@@ -678,11 +721,32 @@ func (h *Handler) GetMyChatPIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, chatPINResponse{PIN: pin, ExpiresAt: expiry})
+	writeJSON(w, http.StatusOK, pinStatusFor(user))
+}
+
+// pinStatusFor projects a user's PIN settings into the API response, computing the
+// shareable code (and its expiry, for rotating codes) via internal/pin.
+func pinStatusFor(user *models.User) pinStatusResponse {
+	resp := pinStatusResponse{
+		Enabled: user.ChatPinEnabled,
+		Type:    user.ChatPinType,
+	}
+	if !user.ChatPinEnabled {
+		return resp
+	}
+	now := time.Now()
+	if code, ok := pin.CurrentCode(user, now); ok {
+		resp.PIN = code
+		if user.ChatPinType == models.ChatPinRotating {
+			expiry := pin.CurrentExpiry(now)
+			resp.ExpiresAt = &expiry
+		}
+	}
+	return resp
 }
 
 // SearchUsers finds users by username prefix for chat discovery. It returns the user ID,
-// username, and require_pin flag only — the actual PIN is never exposed.
+// username, and chat_pin_enabled flag only — the actual PIN is never exposed.
 func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 	query := strings.TrimSpace(r.URL.Query().Get("username"))
 	if query == "" {
@@ -699,11 +763,11 @@ func (h *Handler) SearchUsers(w http.ResponseWriter, r *http.Request) {
 	results := make([]userSearchResult, 0, len(users))
 	for i := range users {
 		results = append(results, userSearchResult{
-			UserID:      users[i].UserID.String(),
-			Username:    users[i].Username,
-			DisplayName: displayNameOfUser(&users[i]),
-			RequirePIN:  users[i].RequireChatPIN,
-			AvatarURL:   users[i].AvatarURL,
+			UserID:         users[i].UserID.String(),
+			Username:       users[i].Username,
+			DisplayName:    displayNameOfUser(&users[i]),
+			ChatPinEnabled: users[i].ChatPinEnabled,
+			AvatarURL:      users[i].AvatarURL,
 		})
 	}
 
