@@ -16,8 +16,8 @@ import (
 // valid, unexpired 4-digit ChatPIN before they can fetch this user's public key
 // and initiate a chat. ChatPIN and ChatPINExpiry are never serialized to clients.
 type User struct {
-	UserID       uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"user_id"`
-	Username     string    `gorm:"type:varchar(64);uniqueIndex;not null" json:"username"`
+	UserID   uuid.UUID `gorm:"type:uuid;primaryKey;default:gen_random_uuid()" json:"user_id"`
+	Username string    `gorm:"type:varchar(64);uniqueIndex;not null" json:"username"`
 	// DisplayName is the human "real name" shown throughout the client in place
 	// of the login username. Seeded at sign-up (the username for password
 	// accounts, the Google account name for OAuth) and fully editable in profile
