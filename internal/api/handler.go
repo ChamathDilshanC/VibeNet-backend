@@ -25,12 +25,18 @@ import (
 	"gorm.io/gorm"
 )
 
-// Broadcaster delivers a pre-marshalled frame to every connected WebSocket
-// client. The websocket Hub satisfies it; it is declared here as an interface so
-// the api package can push live updates without importing websocket (which would
+// Broadcaster delivers pre-marshalled frames to connected WebSocket clients.
+// The websocket Hub satisfies it; it is declared here as an interface so the
+// api package can push live updates without importing websocket (which would
 // be a cycle — websocket already imports api). Injected via SetBroadcaster.
 type Broadcaster interface {
+	// Broadcast queues a frame to every connected client, best-effort.
 	Broadcast(payload []byte)
+	// DeliverToUser queues a frame to one user's live connection, if any.
+	DeliverToUser(receiverID uuid.UUID, payload []byte) bool
+	// InvalidateGroup drops the hub's cached member list for a group so the
+	// next group frame sees membership changes (e.g. an accepted invite).
+	InvalidateGroup(groupID uuid.UUID)
 }
 
 // Handler groups REST dependencies for auth and user routes.
@@ -191,6 +197,12 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Get("/users/{id}/key", h.GetUserPublicKey)
 			r.Post("/users/{id}/verify-pin", h.VerifyPeerPin)
 			r.Get("/messages/{chatRoomID}", h.GetChatHistory)
+			r.Post("/groups/create", h.CreateGroup)
+			r.Get("/groups", h.ListGroups)
+			r.Post("/groups/invite", h.InviteToGroup)
+			r.Get("/invites", h.ListInvites)
+			r.Post("/invites/accept", h.AcceptInvite)
+			r.Post("/invites/decline", h.DeclineInvite)
 		})
 	})
 }
@@ -894,10 +906,30 @@ func (h *Handler) GetChatHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parts := strings.Split(chatRoomID, ":")
-	if len(parts) != 2 || (parts[0] != userID.String() && parts[1] != userID.String()) {
-		writeError(w, http.StatusForbidden, "not a participant of this chat room")
-		return
+	// Two room shapes exist: "group:<group_id>" (membership checked in Postgres)
+	// and the direct-message "<user_id>:<user_id>" pair (the caller must be one
+	// of the two IDs).
+	if groupIDRaw, isGroup := strings.CutPrefix(chatRoomID, "group:"); isGroup {
+		groupID, err := uuid.Parse(groupIDRaw)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid chat room id")
+			return
+		}
+		isMember, err := h.postgres.IsGroupMember(r.Context(), groupID, userID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to verify group membership")
+			return
+		}
+		if !isMember {
+			writeError(w, http.StatusForbidden, "not a participant of this chat room")
+			return
+		}
+	} else {
+		parts := strings.Split(chatRoomID, ":")
+		if len(parts) != 2 || (parts[0] != userID.String() && parts[1] != userID.String()) {
+			writeError(w, http.StatusForbidden, "not a participant of this chat room")
+			return
+		}
 	}
 
 	limit := int32(50)

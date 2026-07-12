@@ -90,7 +90,13 @@ func ConnectPostgres(cfg PostgresConfig) (*gorm.DB, error) {
 	sqlDB.SetMaxIdleConns(10)
 	sqlDB.SetConnMaxLifetime(5 * time.Minute)
 
-	if err := database.AutoMigrate(&models.User{}, &models.Contact{}); err != nil {
+	if err := database.AutoMigrate(
+		&models.User{},
+		&models.Contact{},
+		&models.Group{},
+		&models.GroupMember{},
+		&models.GroupInvite{},
+	); err != nil {
 		return nil, fmt.Errorf("auto-migrate postgres schema: %w", err)
 	}
 

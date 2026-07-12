@@ -35,10 +35,15 @@ const (
 // carries the encrypted payload; for a "read" frame only Type, ReceiverID (the
 // original sender to notify) and ChatRoomID are used; for a "presence" frame
 // only Type and UserIDs (the peers whose online state is being queried).
+//
+// GroupID switches a "message" or "typing" frame into group-room mode: instead
+// of routing to a single ReceiverID, the hub fans the frame out to every member
+// of the group (except the sender). ReceiverID is ignored on group frames.
 type inboundMessage struct {
 	Type       string   `json:"type"`
 	MessageID  string   `json:"message_id"`
 	ReceiverID string   `json:"receiver_id"`
+	GroupID    string   `json:"group_id"`
 	ChatRoomID string   `json:"chat_room_id"`
 	Ciphertext string   `json:"ciphertext"`
 	Nonce      string   `json:"nonce"`
@@ -49,11 +54,13 @@ type inboundMessage struct {
 	IsTyping bool `json:"is_typing"`
 }
 
-// outboundMessage is the encrypted payload delivered to a recipient's WebSocket connection.
+// outboundMessage is the encrypted payload delivered to a recipient's WebSocket
+// connection. GroupID is set only on group-room messages.
 type outboundMessage struct {
 	Type       string `json:"type"`
 	MessageID  string `json:"message_id"`
 	SenderID   string `json:"sender_id"`
+	GroupID    string `json:"group_id,omitempty"`
 	ChatRoomID string `json:"chat_room_id"`
 	Ciphertext string `json:"ciphertext"`
 	Nonce      string `json:"nonce"`
@@ -85,10 +92,13 @@ type presenceFrame struct {
 }
 
 // typingFrame is routed to the receiver when a peer starts/stops composing, so
-// their client can show or hide the typing indicator for the sender.
+// their client can show or hide the typing indicator for the sender. In a group
+// room it fans out to every member and GroupID identifies which group header
+// should show "<sender> is typing…".
 type typingFrame struct {
 	Type       string `json:"type"`
 	SenderID   string `json:"sender_id"`
+	GroupID    string `json:"group_id,omitempty"`
 	ChatRoomID string `json:"chat_room_id"`
 	IsTyping   bool   `json:"is_typing"`
 }
@@ -173,9 +183,14 @@ func (c *Client) handleMessage(raw []byte) {
 	}
 }
 
-// handleTyping forwards a composing/stopped signal to the receiver so their
-// client can toggle the typing indicator. Carries no content — purely a UI hint.
+// handleTyping forwards a composing/stopped signal so recipients can toggle the
+// typing indicator. Carries no content — purely a UI hint. With a group_id the
+// signal fans out to every group member instead of a single receiver.
 func (c *Client) handleTyping(inbound inboundMessage) {
+	if inbound.GroupID != "" {
+		c.handleGroupTyping(inbound)
+		return
+	}
 	if inbound.ReceiverID == "" || inbound.ChatRoomID == "" {
 		return
 	}
@@ -195,6 +210,31 @@ func (c *Client) handleTyping(inbound inboundMessage) {
 		return
 	}
 	c.hub.DeliverToUser(receiverID, payload)
+}
+
+// handleGroupTyping fans a typing signal out to the sender's fellow group
+// members, after confirming the sender actually belongs to the group.
+func (c *Client) handleGroupTyping(inbound inboundMessage) {
+	groupID, err := uuid.Parse(inbound.GroupID)
+	if err != nil {
+		log.Printf("websocket: invalid group_id %q on typing frame from user %s", inbound.GroupID, c.userID)
+		return
+	}
+	if !c.hub.IsGroupMemberCached(groupID, c.userID) {
+		return
+	}
+
+	payload, err := json.Marshal(typingFrame{
+		Type:       frameTyping,
+		SenderID:   c.userID.String(),
+		GroupID:    inbound.GroupID,
+		ChatRoomID: groupChatRoomID(groupID),
+		IsTyping:   inbound.IsTyping,
+	})
+	if err != nil {
+		return
+	}
+	c.hub.DeliverToGroup(groupID, c.userID, payload)
 }
 
 // handlePresence answers a presence query: of the requested user IDs, report
@@ -236,9 +276,84 @@ func (c *Client) handleReadReceipt(inbound inboundMessage) {
 	c.hub.DeliverToUser(senderID, payload)
 }
 
+// groupChatRoomID derives the canonical DynamoDB room id for a group. Derived
+// server-side from the authenticated frame's group_id — never taken from the
+// client's chat_room_id — so a member can't write into another room's history.
+func groupChatRoomID(groupID uuid.UUID) string {
+	return "group:" + groupID.String()
+}
+
+// handleGroupChatMessage validates an inbound group payload, fans it out to
+// every other member, acks the sender, and persists it once under the group's
+// room id. Delivery follows the same best-effort contract as 1:1 messages —
+// offline members catch up from history (GET /api/messages/group:<id>).
+func (c *Client) handleGroupChatMessage(inbound inboundMessage) {
+	if inbound.Ciphertext == "" || inbound.Nonce == "" {
+		log.Printf("websocket: missing required fields on group message from user %s", c.userID)
+		return
+	}
+	groupID, err := uuid.Parse(inbound.GroupID)
+	if err != nil {
+		log.Printf("websocket: invalid group_id %q from user %s: %v", inbound.GroupID, c.userID, err)
+		return
+	}
+	// Only members may post into a group room.
+	if !c.hub.IsGroupMemberCached(groupID, c.userID) {
+		log.Printf("websocket: user %s is not a member of group %s, dropping message", c.userID, groupID)
+		return
+	}
+
+	if inbound.Timestamp == 0 {
+		inbound.Timestamp = time.Now().UnixMilli()
+	}
+	if inbound.MessageID == "" {
+		inbound.MessageID = uuid.NewString()
+	}
+	chatRoomID := groupChatRoomID(groupID)
+
+	payload, err := json.Marshal(outboundMessage{
+		Type:       frameMessage,
+		MessageID:  inbound.MessageID,
+		SenderID:   c.userID.String(),
+		GroupID:    inbound.GroupID,
+		ChatRoomID: chatRoomID,
+		Ciphertext: inbound.Ciphertext,
+		Nonce:      inbound.Nonce,
+		Timestamp:  inbound.Timestamp,
+	})
+	if err != nil {
+		log.Printf("websocket: failed to marshal outbound group message: %v", err)
+		return
+	}
+
+	// delivered flips the sender's tick to double as soon as ANY member
+	// received the fan-out — the closest group analogue of the 1:1 ack.
+	delivered := c.hub.DeliverToGroup(groupID, c.userID, payload)
+	c.trySend(ackFrame{
+		Type:       frameAck,
+		MessageID:  inbound.MessageID,
+		ChatRoomID: chatRoomID,
+		Delivered:  delivered > 0,
+	})
+
+	go func(messageID, chatRoomID, senderID, ciphertext, nonce string, timestamp int64) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := c.dynamo.SaveMessage(ctx, messageID, chatRoomID, senderID, ciphertext, nonce, timestamp); err != nil {
+			log.Printf("websocket: async dynamodb save failed for group message %s: %v", messageID, err)
+		}
+	}(inbound.MessageID, chatRoomID, c.userID.String(), inbound.Ciphertext, inbound.Nonce, inbound.Timestamp)
+}
+
 // handleChatMessage validates an inbound encrypted payload, delivers it to the
-// receiver, acknowledges delivery back to the sender, and persists it.
+// receiver, acknowledges delivery back to the sender, and persists it. Frames
+// carrying a group_id are routed to the whole group room instead.
 func (c *Client) handleChatMessage(inbound inboundMessage) {
+	if inbound.GroupID != "" {
+		c.handleGroupChatMessage(inbound)
+		return
+	}
 	if inbound.ReceiverID == "" || inbound.ChatRoomID == "" || inbound.Ciphertext == "" || inbound.Nonce == "" {
 		log.Printf("websocket: missing required fields from user %s", c.userID)
 		return

@@ -13,25 +13,43 @@ import (
 	"github.com/google/uuid"
 )
 
+// groupMembersTTL bounds how long a group's member list is served from the
+// in-process cache. Group frames (messages, typing) can fan out several times a
+// second, so hitting Postgres per frame would be wasteful — but membership must
+// converge quickly after a join. REST-side joins call InvalidateGroup for an
+// instant refresh; the TTL is the backstop for anything that slips through.
+const groupMembersTTL = 30 * time.Second
+
+// groupMembersEntry is one cached group roster with its expiry.
+type groupMembersEntry struct {
+	memberIDs []uuid.UUID
+	expiresAt time.Time
+}
+
 // Hub maintains active WebSocket connections and routes encrypted payloads between clients.
 type Hub struct {
 	clients    map[uuid.UUID]*Client
 	register   chan *Client
 	unregister chan *Client
 	mu         sync.RWMutex
-	// postgres stamps last_seen when a user disconnects. Optional (nil in tests):
-	// presence broadcasts still fire, only the DB write is skipped.
+	// postgres stamps last_seen when a user disconnects and resolves group
+	// membership for room fan-out. Optional (nil in tests): presence broadcasts
+	// still fire and group routing degrades to a no-op.
 	postgres *db.PostgresRepo
+	// groupMembers caches group rosters for room broadcasts (see groupMembersTTL).
+	groupMembers   map[uuid.UUID]groupMembersEntry
+	groupMembersMu sync.Mutex
 }
 
 // NewHub creates and starts a Hub event loop in a background goroutine. postgres
 // may be nil (e.g. in tests) to skip last-seen persistence.
 func NewHub(postgres *db.PostgresRepo) *Hub {
 	hub := &Hub{
-		clients:    make(map[uuid.UUID]*Client),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-		postgres:   postgres,
+		clients:      make(map[uuid.UUID]*Client),
+		register:     make(chan *Client),
+		unregister:   make(chan *Client),
+		postgres:     postgres,
+		groupMembers: make(map[uuid.UUID]groupMembersEntry),
 	}
 	go hub.run()
 	return hub
@@ -163,4 +181,93 @@ func (h *Hub) IsOnline(userID uuid.UUID) bool {
 	defer h.mu.RUnlock()
 	_, ok := h.clients[userID]
 	return ok
+}
+
+// GroupMemberIDs resolves a group's member list for room routing, serving from
+// the short-TTL cache when fresh. Returns nil (not an error) when the hub has
+// no Postgres handle (tests) — group routing is then a no-op.
+func (h *Hub) GroupMemberIDs(groupID uuid.UUID) ([]uuid.UUID, error) {
+	if h.postgres == nil {
+		return nil, nil
+	}
+
+	h.groupMembersMu.Lock()
+	entry, ok := h.groupMembers[groupID]
+	h.groupMembersMu.Unlock()
+	if ok && time.Now().Before(entry.expiresAt) {
+		return entry.memberIDs, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	memberIDs, err := h.postgres.GetGroupMemberIDs(ctx, groupID)
+	if err != nil {
+		return nil, err
+	}
+
+	h.groupMembersMu.Lock()
+	h.groupMembers[groupID] = groupMembersEntry{
+		memberIDs: memberIDs,
+		expiresAt: time.Now().Add(groupMembersTTL),
+	}
+	h.groupMembersMu.Unlock()
+	return memberIDs, nil
+}
+
+// InvalidateGroup drops a group's cached member list so the next frame re-reads
+// membership from Postgres. Called by the REST layer when someone joins.
+func (h *Hub) InvalidateGroup(groupID uuid.UUID) {
+	h.groupMembersMu.Lock()
+	delete(h.groupMembers, groupID)
+	h.groupMembersMu.Unlock()
+}
+
+// IsGroupMemberCached reports whether userID is in the group's (possibly
+// cached) member list — the authorization check for inbound group frames.
+func (h *Hub) IsGroupMemberCached(groupID, userID uuid.UUID) bool {
+	memberIDs, err := h.GroupMemberIDs(groupID)
+	if err != nil {
+		log.Printf("websocket: group membership lookup failed for %s: %v", groupID, err)
+		return false
+	}
+	for _, id := range memberIDs {
+		if id == userID {
+			return true
+		}
+	}
+	return false
+}
+
+// DeliverToGroup queues an encrypted payload to every member of the group that
+// currently has a live connection, skipping the sender (whose client already
+// rendered the message optimistically). Returns how many members it reached —
+// zero both when everyone is offline and when the membership lookup failed.
+func (h *Hub) DeliverToGroup(groupID, senderID uuid.UUID, payload []byte) int {
+	memberIDs, err := h.GroupMemberIDs(groupID)
+	if err != nil {
+		log.Printf("websocket: group fan-out aborted, membership lookup failed for %s: %v", groupID, err)
+		return 0
+	}
+
+	// Route directly rather than via DeliverToUser: an offline member is the
+	// normal case in a group, not a "route miss" worth a log line each.
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	delivered := 0
+	for _, memberID := range memberIDs {
+		if memberID == senderID {
+			continue
+		}
+		client, ok := h.clients[memberID]
+		if !ok {
+			continue
+		}
+		select {
+		case client.send <- payload:
+			delivered++
+		default:
+			log.Printf("websocket: group send buffer full for user %s", memberID)
+		}
+	}
+	return delivered
 }
