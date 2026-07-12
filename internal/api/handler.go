@@ -200,6 +200,8 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Post("/groups/create", h.CreateGroup)
 			r.Get("/groups", h.ListGroups)
 			r.Post("/groups/invite", h.InviteToGroup)
+			r.Put("/groups/{id}", h.UpdateGroup)
+			r.Post("/groups/{id}/avatar", h.UploadGroupAvatar)
 			r.Get("/invites", h.ListInvites)
 			r.Post("/invites/accept", h.AcceptInvite)
 			r.Post("/invites/decline", h.DeclineInvite)
@@ -436,6 +438,73 @@ var allowedAvatarTypes = map[string]string{
 	"image/gif":  ".gif",
 }
 
+// storeUploadedAvatar validates and persists a multipart image upload (the
+// "avatar" field) under a random UUID filename in the avatars directory. It
+// writes the error response itself on failure (ok=false); on success it
+// returns the public backend-relative URL and the on-disk path so the caller
+// can clean up if its own DB write fails. Shared by the user-profile and
+// group-photo upload endpoints.
+func (h *Handler) storeUploadedAvatar(w http.ResponseWriter, r *http.Request) (avatarURL, dstPath string, ok bool) {
+	// Cap the request body before parsing so an oversized upload is rejected
+	// without buffering it all into memory or disk.
+	r.Body = http.MaxBytesReader(w, r.Body, maxAvatarBytes)
+	if err := r.ParseMultipartForm(maxAvatarBytes); err != nil {
+		writeError(w, http.StatusBadRequest, "image is too large (max 5 MB) or the upload was malformed")
+		return "", "", false
+	}
+
+	file, _, err := r.FormFile("avatar")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "no image file provided under the \"avatar\" field")
+		return "", "", false
+	}
+	defer file.Close()
+
+	// Sniff the real content type from the first bytes rather than trusting the
+	// client's declared type or filename, then map it to an allowed extension.
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(file, head)
+	contentType := http.DetectContentType(head[:n])
+	ext, allowed := allowedAvatarTypes[contentType]
+	if !allowed {
+		writeError(w, http.StatusBadRequest, "unsupported image type; use JPEG, PNG, WebP, or GIF")
+		return "", "", false
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read image")
+		return "", "", false
+	}
+
+	if err := os.MkdirAll(h.avatarDir, 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to store image")
+		return "", "", false
+	}
+	// The filename is a fresh UUID plus the vetted extension — no user input reaches
+	// the path, so there is nothing to traverse out of the avatars directory.
+	filename := uuid.NewString() + ext
+	dstPath = filepath.Join(h.avatarDir, filename)
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to store image")
+		return "", "", false
+	}
+	if _, err := io.Copy(dst, file); err != nil {
+		dst.Close()
+		os.Remove(dstPath)
+		writeError(w, http.StatusInternalServerError, "failed to store image")
+		return "", "", false
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(dstPath)
+		writeError(w, http.StatusInternalServerError, "failed to store image")
+		return "", "", false
+	}
+
+	// Return a backend-relative path; the client prefixes its API origin when it
+	// loads the image. This keeps the value portable across environments.
+	return "/uploads/avatars/" + filename, dstPath, true
+}
+
 // UploadAvatar accepts a multipart/form-data image under the "avatar" field,
 // stores it under a random UUID filename in the avatars directory, points the
 // user's avatar_url at the public URL, and broadcasts the change so every peer's
@@ -447,64 +516,11 @@ func (h *Handler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cap the request body before parsing so an oversized upload is rejected
-	// without buffering it all into memory or disk.
-	r.Body = http.MaxBytesReader(w, r.Body, maxAvatarBytes)
-	if err := r.ParseMultipartForm(maxAvatarBytes); err != nil {
-		writeError(w, http.StatusBadRequest, "image is too large (max 5 MB) or the upload was malformed")
-		return
-	}
-
-	file, _, err := r.FormFile("avatar")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "no image file provided under the \"avatar\" field")
-		return
-	}
-	defer file.Close()
-
-	// Sniff the real content type from the first bytes rather than trusting the
-	// client's declared type or filename, then map it to an allowed extension.
-	head := make([]byte, 512)
-	n, _ := io.ReadFull(file, head)
-	contentType := http.DetectContentType(head[:n])
-	ext, ok := allowedAvatarTypes[contentType]
+	avatarURL, dstPath, ok := h.storeUploadedAvatar(w, r)
 	if !ok {
-		writeError(w, http.StatusBadRequest, "unsupported image type; use JPEG, PNG, WebP, or GIF")
-		return
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to read image")
 		return
 	}
 
-	if err := os.MkdirAll(h.avatarDir, 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to store image")
-		return
-	}
-	// The filename is a fresh UUID plus the vetted extension — no user input reaches
-	// the path, so there is nothing to traverse out of the avatars directory.
-	filename := uuid.NewString() + ext
-	dstPath := filepath.Join(h.avatarDir, filename)
-	dst, err := os.Create(dstPath)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to store image")
-		return
-	}
-	if _, err := io.Copy(dst, file); err != nil {
-		dst.Close()
-		os.Remove(dstPath)
-		writeError(w, http.StatusInternalServerError, "failed to store image")
-		return
-	}
-	if err := dst.Close(); err != nil {
-		os.Remove(dstPath)
-		writeError(w, http.StatusInternalServerError, "failed to store image")
-		return
-	}
-
-	// Store a backend-relative path; the client prefixes its API origin when it
-	// loads the image. This keeps the value portable across environments.
-	avatarURL := "/uploads/avatars/" + filename
 	user, err := h.postgres.UpdateAvatarURL(r.Context(), userID, avatarURL)
 	if err != nil {
 		// Don't leave an orphaned file behind if the DB write fails.

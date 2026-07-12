@@ -171,6 +171,34 @@ func (r *PostgresRepo) ListGroupsForUser(ctx context.Context, userID uuid.UUID) 
 	return result, nil
 }
 
+// UpdateGroupName renames a group. Zero rows affected can also mean the name
+// was unchanged, so a missing group is confirmed by the caller's follow-up read.
+func (r *PostgresRepo) UpdateGroupName(ctx context.Context, groupID uuid.UUID, name string) error {
+	result := r.db.WithContext(ctx).Model(&models.Group{}).
+		Where("group_id = ?", groupID).
+		Update("name", name)
+	if result.Error != nil {
+		return fmt.Errorf("update group name: %w", result.Error)
+	}
+	return nil
+}
+
+// UpdateGroupAvatar points a group's photo at a freshly-uploaded image URL.
+// Every upload writes a new UUID filename, so zero rows affected means the
+// group is gone — reported as gorm.ErrRecordNotFound.
+func (r *PostgresRepo) UpdateGroupAvatar(ctx context.Context, groupID uuid.UUID, avatarURL string) error {
+	result := r.db.WithContext(ctx).Model(&models.Group{}).
+		Where("group_id = ?", groupID).
+		Update("avatar_url", avatarURL)
+	if result.Error != nil {
+		return fmt.Errorf("update group avatar: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
 // GetGroupMemberIDs returns the user IDs of everyone in the group — the
 // broadcast fan-out list the WebSocket hub routes group frames to.
 func (r *PostgresRepo) GetGroupMemberIDs(ctx context.Context, groupID uuid.UUID) ([]uuid.UUID, error) {

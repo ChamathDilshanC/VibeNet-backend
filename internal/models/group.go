@@ -15,6 +15,12 @@ type Group struct {
 	Name      string    `gorm:"type:varchar(64);not null" json:"name"`
 	CreatedBy uuid.UUID `gorm:"type:uuid;not null" json:"created_by"`
 	CreatedAt time.Time `gorm:"autoCreateTime" json:"created_at"`
+
+	// AvatarURL is the group photo, uploaded by any member (POST
+	// /api/groups/{id}/avatar) and stored like user avatars: a backend-relative
+	// "/uploads/avatars/…" path the client rebases onto its API origin. Nil
+	// until a photo is set — clients fall back to name initials.
+	AvatarURL *string `gorm:"type:text" json:"avatar_url,omitempty"`
 }
 
 // TableName overrides the default GORM table name for the Group model.

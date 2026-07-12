@@ -9,13 +9,16 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -72,6 +75,7 @@ type groupDTO struct {
 	Name       string           `json:"name"`
 	CreatedBy  string           `json:"created_by"`
 	CreatedAt  int64            `json:"created_at"`
+	AvatarURL  *string          `json:"avatar_url,omitempty"`
 	Members    []groupMemberDTO `json:"members"`
 	WrappedKey string           `json:"wrapped_key"`
 	KeyNonce   string           `json:"key_nonce"`
@@ -125,11 +129,131 @@ func toGroupDTO(g *db.GroupWithMembers) groupDTO {
 		Name:       g.Group.Name,
 		CreatedBy:  g.Group.CreatedBy.String(),
 		CreatedAt:  g.Group.CreatedAt.UnixMilli(),
+		AvatarURL:  g.Group.AvatarURL,
 		Members:    members,
 		WrappedKey: g.Membership.WrappedKey,
 		KeyNonce:   g.Membership.KeyNonce,
 		WrappedBy:  g.Membership.WrappedBy.String(),
 	}
+}
+
+// requireGroupMember parses the {id} route param and verifies the caller
+// belongs to that group, writing the error response itself when not. Shared
+// guard for the group-settings endpoints (rename, photo).
+func (h *Handler) requireGroupMember(w http.ResponseWriter, r *http.Request, userID uuid.UUID) (uuid.UUID, bool) {
+	groupID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid group id")
+		return uuid.Nil, false
+	}
+	isMember, err := h.postgres.IsGroupMember(r.Context(), groupID, userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to verify group membership")
+		return uuid.Nil, false
+	}
+	if !isMember {
+		writeError(w, http.StatusForbidden, "you are not a member of this group")
+		return uuid.Nil, false
+	}
+	return groupID, true
+}
+
+// notifyGroupUpdated nudges every member's live clients that the group's
+// settings or roster changed, so sidebars and open headers refresh. The frame
+// deliberately omits the name — a name is only attached when someone is being
+// ADDED to a group (it drives the "You were added" toast).
+func (h *Handler) notifyGroupUpdated(ctx context.Context, groupID uuid.UUID) {
+	memberIDs, err := h.postgres.GetGroupMemberIDs(ctx, groupID)
+	if err != nil {
+		return
+	}
+	for _, memberID := range memberIDs {
+		h.deliverFrame(memberID, groupUpdateFrame{
+			Type:    "group_update",
+			GroupID: groupID.String(),
+		})
+	}
+}
+
+// UpdateGroup renames a group. Any member may rename (matching the invite
+// policy); the change is broadcast so every member's UI updates live.
+func (h *Handler) UpdateGroup(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	groupID, ok := h.requireGroupMember(w, r, userID)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if err := validateGroupName(req.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := h.postgres.UpdateGroupName(r.Context(), groupID, req.Name); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to rename group")
+		return
+	}
+
+	full, err := h.postgres.GetGroupWithMembers(r.Context(), groupID, userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load group")
+		return
+	}
+
+	h.notifyGroupUpdated(r.Context(), groupID)
+	writeJSON(w, http.StatusOK, toGroupDTO(full))
+}
+
+// UploadGroupAvatar sets the group photo from a multipart "avatar" upload,
+// stored exactly like user avatars. Any member may change it; the update is
+// broadcast so every member's sidebar and header refresh live.
+func (h *Handler) UploadGroupAvatar(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	groupID, ok := h.requireGroupMember(w, r, userID)
+	if !ok {
+		return
+	}
+
+	avatarURL, dstPath, ok := h.storeUploadedAvatar(w, r)
+	if !ok {
+		return
+	}
+
+	if err := h.postgres.UpdateGroupAvatar(r.Context(), groupID, avatarURL); err != nil {
+		// Don't leave an orphaned file behind if the DB write fails.
+		os.Remove(dstPath)
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "group not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to update group photo")
+		return
+	}
+
+	full, err := h.postgres.GetGroupWithMembers(r.Context(), groupID, userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load group")
+		return
+	}
+
+	h.notifyGroupUpdated(r.Context(), groupID)
+	writeJSON(w, http.StatusOK, toGroupDTO(full))
 }
 
 // deliverFrame marshals and pushes a frame to one user's live connection.
