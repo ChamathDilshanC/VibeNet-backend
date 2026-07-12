@@ -256,6 +256,17 @@ func (r *PostgresRepo) LeaveGroup(ctx context.Context, groupID, userID uuid.UUID
 			return fmt.Errorf("remove member: %w", delErr)
 		}
 
+		// Clear their own invite record too (if any — a direct-added member or
+		// the creator never had one). Left behind, it stays "accepted" forever;
+		// CreateInvite trusts that status as proof of current membership, so a
+		// future re-invite would find the stale row and wrongly report them as
+		// already a member even though they just left. This only ever touches
+		// an invite addressed to the user who's leaving, not the group's others.
+		if delErr := tx.Where("group_id = ? AND to_user = ?", groupID, userID).
+			Delete(&models.GroupInvite{}).Error; delErr != nil {
+			return fmt.Errorf("clear leaving member's invite record: %w", delErr)
+		}
+
 		var remaining []models.GroupMember
 		if listErr := tx.Where("group_id = ?", groupID).
 			Order("joined_at ASC").
