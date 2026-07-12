@@ -29,6 +29,8 @@ const (
 	framePresence       = "presence"
 	frameTyping         = "typing"
 	framePresenceUpdate = "presence_update"
+	framePin            = "pin_message"
+	frameUnpin          = "unpin_message"
 )
 
 // inboundMessage is a frame sent by a connected client. For a chat message it
@@ -36,9 +38,10 @@ const (
 // original sender to notify) and ChatRoomID are used; for a "presence" frame
 // only Type and UserIDs (the peers whose online state is being queried).
 //
-// GroupID switches a "message" or "typing" frame into group-room mode: instead
-// of routing to a single ReceiverID, the hub fans the frame out to every member
-// of the group (except the sender). ReceiverID is ignored on group frames.
+// GroupID switches a "message", "typing", "pin_message", or "unpin_message"
+// frame into group-room mode: instead of routing to a single ReceiverID, the
+// hub fans the frame out to every member of the group (except the sender).
+// ReceiverID is ignored on group frames.
 type inboundMessage struct {
 	Type       string   `json:"type"`
 	MessageID  string   `json:"message_id"`
@@ -101,6 +104,16 @@ type typingFrame struct {
 	GroupID    string `json:"group_id,omitempty"`
 	ChatRoomID string `json:"chat_room_id"`
 	IsTyping   bool   `json:"is_typing"`
+}
+
+// pinFrame is routed to the DM peer, or fanned out to every group member, when
+// a participant pins or unpins a message for the whole room — Type alone
+// (pin_message vs unpin_message) is the signal; there is no content to carry.
+type pinFrame struct {
+	Type       string `json:"type"`
+	MessageID  string `json:"message_id"`
+	GroupID    string `json:"group_id,omitempty"`
+	ChatRoomID string `json:"chat_room_id"`
 }
 
 // presenceUpdateFrame is broadcast when a user connects or disconnects, so peers
@@ -178,6 +191,8 @@ func (c *Client) handleMessage(raw []byte) {
 		c.handlePresence(inbound)
 	case frameTyping:
 		c.handleTyping(inbound)
+	case framePin, frameUnpin:
+		c.handlePinToggle(inbound, inbound.Type)
 	default: // frameMessage or empty (backward compatible)
 		c.handleChatMessage(inbound)
 	}
@@ -230,6 +245,63 @@ func (c *Client) handleGroupTyping(inbound inboundMessage) {
 		GroupID:    inbound.GroupID,
 		ChatRoomID: groupChatRoomID(groupID),
 		IsTyping:   inbound.IsTyping,
+	})
+	if err != nil {
+		return
+	}
+	c.hub.DeliverToGroup(groupID, c.userID, payload)
+}
+
+// handlePinToggle forwards a pin/unpin signal so the shared pinned state stays
+// in sync everywhere the message lives — the DM peer, or every member of a
+// group. Carries no content: the sender's own local mirror is already set by
+// the time this fires, so this only notifies everyone else. frameType selects
+// pin_message or unpin_message on the outbound frame.
+func (c *Client) handlePinToggle(inbound inboundMessage, frameType string) {
+	if inbound.MessageID == "" {
+		return
+	}
+	if inbound.GroupID != "" {
+		c.handleGroupPinToggle(inbound, frameType)
+		return
+	}
+	if inbound.ReceiverID == "" || inbound.ChatRoomID == "" {
+		return
+	}
+	receiverID, err := uuid.Parse(inbound.ReceiverID)
+	if err != nil {
+		log.Printf("websocket: invalid receiver_id %q on %s frame from user %s", inbound.ReceiverID, frameType, c.userID)
+		return
+	}
+
+	payload, err := json.Marshal(pinFrame{
+		Type:       frameType,
+		MessageID:  inbound.MessageID,
+		ChatRoomID: inbound.ChatRoomID,
+	})
+	if err != nil {
+		return
+	}
+	c.hub.DeliverToUser(receiverID, payload)
+}
+
+// handleGroupPinToggle fans a pin/unpin signal out to the sender's fellow
+// group members, after confirming the sender actually belongs to the group.
+func (c *Client) handleGroupPinToggle(inbound inboundMessage, frameType string) {
+	groupID, err := uuid.Parse(inbound.GroupID)
+	if err != nil {
+		log.Printf("websocket: invalid group_id %q on %s frame from user %s", inbound.GroupID, frameType, c.userID)
+		return
+	}
+	if !c.hub.IsGroupMemberCached(groupID, c.userID) {
+		return
+	}
+
+	payload, err := json.Marshal(pinFrame{
+		Type:       frameType,
+		MessageID:  inbound.MessageID,
+		GroupID:    inbound.GroupID,
+		ChatRoomID: groupChatRoomID(groupID),
 	})
 	if err != nil {
 		return
