@@ -43,13 +43,25 @@ type createGroupRequest struct {
 	} `json:"members"`
 }
 
-// inviteRequest is the body of POST /api/groups/invite: invite a user (by
-// username) to a group the caller belongs to, with the group key wrapped for
-// them by the caller's client.
-type inviteRequest struct {
-	GroupID  string `json:"group_id"`
+// addMemberRequest is the body of POST /api/groups/{id}/members: add a user
+// (by username) to the group named in the URL, with the group key wrapped for
+// them by the caller's client. Restricted to the group's owner or an admin —
+// see requireGroupAdmin.
+//
+// This records a pending invite rather than an instant membership row: the
+// invitee must explicitly accept (see AcceptInvite) before joining, the same
+// consent posture the rest of VibeNet uses (e.g. the DM chat-PIN gate). The
+// "Add member" name matches how the client presents it — from the acting
+// owner/admin's point of view they ARE adding someone — even though it lands
+// as a pending invite until accepted.
+type addMemberRequest struct {
 	Username string `json:"username"`
 	wrappedKeyPayload
+}
+
+// updateMemberRoleRequest is the body of PUT /api/groups/{id}/members/{user_id}/role.
+type updateMemberRoleRequest struct {
+	Role string `json:"role"`
 }
 
 // inviteActionRequest is the body of POST /api/invites/accept and /decline.
@@ -139,7 +151,7 @@ func toGroupDTO(g *db.GroupWithMembers) groupDTO {
 
 // requireGroupMember parses the {id} route param and verifies the caller
 // belongs to that group, writing the error response itself when not. Shared
-// guard for the group-settings endpoints (rename, photo).
+// guard for the group-settings endpoints (rename, photo) that any member may use.
 func (h *Handler) requireGroupMember(w http.ResponseWriter, r *http.Request, userID uuid.UUID) (uuid.UUID, bool) {
 	groupID, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
@@ -153,6 +165,33 @@ func (h *Handler) requireGroupMember(w http.ResponseWriter, r *http.Request, use
 	}
 	if !isMember {
 		writeError(w, http.StatusForbidden, "you are not a member of this group")
+		return uuid.Nil, false
+	}
+	return groupID, true
+}
+
+// requireGroupAdmin parses the {id} route param and verifies the caller is a
+// member of that group with role "owner" or "admin" — the authorization gate
+// for member-management actions (adding members, promoting/demoting). Writes
+// the error response itself when the check fails: 403 for a regular member or
+// a non-member, matching the "reject requests from regular members" policy.
+func (h *Handler) requireGroupAdmin(w http.ResponseWriter, r *http.Request, userID uuid.UUID) (uuid.UUID, bool) {
+	groupID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid group id")
+		return uuid.Nil, false
+	}
+	role, err := h.postgres.GetGroupMemberRole(r.Context(), groupID, userID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusForbidden, "you are not a member of this group")
+			return uuid.Nil, false
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify group membership")
+		return uuid.Nil, false
+	}
+	if role != models.GroupRoleOwner && role != models.GroupRoleAdmin {
+		writeError(w, http.StatusForbidden, "only the group owner or an admin can do this")
 		return uuid.Nil, false
 	}
 	return groupID, true
@@ -387,25 +426,26 @@ func (h *Handler) ListGroups(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"groups": dtos})
 }
 
-// InviteToGroup sends (or refreshes) an invitation for a user, looked up by
-// username, to join a group the caller belongs to. The invitee is nudged live
-// with an invite_received frame so their invites badge updates immediately.
-func (h *Handler) InviteToGroup(w http.ResponseWriter, r *http.Request) {
+// AddGroupMember sends (or refreshes) an invitation for a user, looked up by
+// username, to join the group identified in the URL. Restricted to the
+// group's owner or an admin — a regular member is rejected with 403 (see
+// requireGroupAdmin). The invitee is nudged live with an invite_received
+// frame so their invites badge updates immediately; they still need to accept
+// (see AcceptInvite) before they actually join.
+func (h *Handler) AddGroupMember(w http.ResponseWriter, r *http.Request) {
 	userID, ok := UserIDFromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-
-	var req inviteRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
+	groupID, ok := h.requireGroupAdmin(w, r, userID)
+	if !ok {
 		return
 	}
 
-	groupID, err := uuid.Parse(strings.TrimSpace(req.GroupID))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid group_id")
+	var req addMemberRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	req.Username = strings.TrimSpace(req.Username)
@@ -415,17 +455,6 @@ func (h *Handler) InviteToGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.WrappedKey == "" || req.KeyNonce == "" {
 		writeError(w, http.StatusBadRequest, "wrapped_key and key_nonce are required")
-		return
-	}
-
-	// Only members may invite, and only into groups they belong to.
-	isMember, err := h.postgres.IsGroupMember(r.Context(), groupID, userID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to verify group membership")
-		return
-	}
-	if !isMember {
-		writeError(w, http.StatusForbidden, "you are not a member of this group")
 		return
 	}
 
@@ -610,4 +639,106 @@ func (h *Handler) DeclineInvite(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": models.InviteStatusDeclined})
+}
+
+// UpdateMemberRole promotes a member to admin or demotes an admin back to
+// member. Restricted to the group's owner or an admin (see requireGroupAdmin);
+// the owner's own role is immutable through this endpoint — VibeNet has no
+// separate ownership-transfer flow (see LeaveGroup for how ownership actually
+// moves). The updated roster is broadcast so every member's role badges
+// refresh live.
+func (h *Handler) UpdateMemberRole(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	groupID, ok := h.requireGroupAdmin(w, r, userID)
+	if !ok {
+		return
+	}
+
+	targetID, err := uuid.Parse(chi.URLParam(r, "user_id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+
+	var req updateMemberRoleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Role = strings.TrimSpace(req.Role)
+	if req.Role != models.GroupRoleAdmin && req.Role != models.GroupRoleMember {
+		writeError(w, http.StatusBadRequest, `role must be "admin" or "member"`)
+		return
+	}
+
+	targetRole, err := h.postgres.GetGroupMemberRole(r.Context(), groupID, targetID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "that user is not a member of this group")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify target membership")
+		return
+	}
+	if targetRole == models.GroupRoleOwner {
+		writeError(w, http.StatusForbidden, "the group owner's role cannot be changed")
+		return
+	}
+
+	if err := h.postgres.UpdateMemberRole(r.Context(), groupID, targetID, req.Role); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update member role")
+		return
+	}
+
+	full, err := h.postgres.GetGroupWithMembers(r.Context(), groupID, userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load group")
+		return
+	}
+
+	h.notifyGroupUpdated(r.Context(), groupID)
+	writeJSON(w, http.StatusOK, toGroupDTO(full))
+}
+
+// LeaveGroup removes the caller from the group named in the URL. If they were
+// its last member, the group (and any pending invites for it) is deleted
+// outright; if they were the owner and others remain, ownership automatically
+// passes to the earliest-joined remaining member (see db.LeaveGroup).
+// Remaining members are nudged live so their roster — and any new "Owner"
+// badge — refreshes without a reload.
+func (h *Handler) LeaveGroup(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	groupID, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid group id")
+		return
+	}
+
+	deleted, err := h.postgres.LeaveGroup(r.Context(), groupID, userID)
+	if err != nil {
+		if errors.Is(err, db.ErrNotGroupMember) {
+			writeError(w, http.StatusNotFound, "you are not a member of this group")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to leave group")
+		return
+	}
+
+	// Stale either way: membership shrank, or the group is gone entirely.
+	if h.broadcaster != nil {
+		h.broadcaster.InvalidateGroup(groupID)
+	}
+	if !deleted {
+		h.notifyGroupUpdated(r.Context(), groupID)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]bool{"left": true})
 }

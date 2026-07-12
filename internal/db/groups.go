@@ -199,6 +199,96 @@ func (r *PostgresRepo) UpdateGroupAvatar(ctx context.Context, groupID uuid.UUID,
 	return nil
 }
 
+// GetGroupMemberRole returns a member's role in the group, or
+// gorm.ErrRecordNotFound if they don't belong to it. Used to authorize
+// role-gated actions (adding members, promoting/demoting) without loading the
+// full roster just to check one row.
+func (r *PostgresRepo) GetGroupMemberRole(ctx context.Context, groupID, userID uuid.UUID) (string, error) {
+	var member models.GroupMember
+	err := r.db.WithContext(ctx).
+		Select("role").
+		Where("group_id = ? AND user_id = ?", groupID, userID).
+		First(&member).Error
+	if err != nil {
+		return "", err
+	}
+	return member.Role, nil
+}
+
+// UpdateMemberRole sets a member's role to "admin" or "member". The owner's
+// row is excluded by the WHERE clause as a defence-in-depth backstop —
+// callers are expected to have already rejected an attempt to target the
+// owner (see UpdateMemberRole in package api) so this returns
+// gorm.ErrRecordNotFound in that case too, same as targeting a non-member.
+func (r *PostgresRepo) UpdateMemberRole(ctx context.Context, groupID, targetUserID uuid.UUID, role string) error {
+	result := r.db.WithContext(ctx).Model(&models.GroupMember{}).
+		Where("group_id = ? AND user_id = ? AND role <> ?", groupID, targetUserID, models.GroupRoleOwner).
+		Update("role", role)
+	if result.Error != nil {
+		return fmt.Errorf("update member role: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+// LeaveGroup removes userID from the group. If they were its only member, the
+// group (and any pending invites for it) is deleted outright rather than left
+// as an orphaned, memberless row. If they were the owner and others remain,
+// ownership passes automatically to the earliest-joined remaining member —
+// VibeNet has no separate "transfer ownership" flow, so this is what keeps a
+// group usable after its owner leaves. Returns ErrNotGroupMember if userID
+// doesn't belong to the group.
+func (r *PostgresRepo) LeaveGroup(ctx context.Context, groupID, userID uuid.UUID) (deleted bool, err error) {
+	err = r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var leaving models.GroupMember
+		if lookupErr := tx.Where("group_id = ? AND user_id = ?", groupID, userID).
+			First(&leaving).Error; lookupErr != nil {
+			if errors.Is(lookupErr, gorm.ErrRecordNotFound) {
+				return ErrNotGroupMember
+			}
+			return fmt.Errorf("lookup leaving member: %w", lookupErr)
+		}
+
+		if delErr := tx.Where("group_id = ? AND user_id = ?", groupID, userID).
+			Delete(&models.GroupMember{}).Error; delErr != nil {
+			return fmt.Errorf("remove member: %w", delErr)
+		}
+
+		var remaining []models.GroupMember
+		if listErr := tx.Where("group_id = ?", groupID).
+			Order("joined_at ASC").
+			Find(&remaining).Error; listErr != nil {
+			return fmt.Errorf("list remaining members: %w", listErr)
+		}
+
+		if len(remaining) == 0 {
+			if delErr := tx.Where("group_id = ?", groupID).
+				Delete(&models.GroupInvite{}).Error; delErr != nil {
+				return fmt.Errorf("delete group invites: %w", delErr)
+			}
+			if delErr := tx.Where("group_id = ?", groupID).
+				Delete(&models.Group{}).Error; delErr != nil {
+				return fmt.Errorf("delete group: %w", delErr)
+			}
+			deleted = true
+			return nil
+		}
+
+		if leaving.Role == models.GroupRoleOwner {
+			successor := remaining[0]
+			if updErr := tx.Model(&models.GroupMember{}).
+				Where("group_id = ? AND user_id = ?", groupID, successor.UserID).
+				Update("role", models.GroupRoleOwner).Error; updErr != nil {
+				return fmt.Errorf("promote successor owner: %w", updErr)
+			}
+		}
+		return nil
+	})
+	return deleted, err
+}
+
 // GetGroupMemberIDs returns the user IDs of everyone in the group — the
 // broadcast fan-out list the WebSocket hub routes group frames to.
 func (r *PostgresRepo) GetGroupMemberIDs(ctx context.Context, groupID uuid.UUID) ([]uuid.UUID, error) {

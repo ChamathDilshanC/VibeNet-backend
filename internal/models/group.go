@@ -28,9 +28,14 @@ func (Group) TableName() string {
 	return "groups"
 }
 
-// Group member roles.
+// Group member roles. Owner is set once at creation (or inherited by the
+// earliest-joined member if the owner leaves — see PostgresRepo.LeaveGroup)
+// and is immutable through the role-update endpoint. Admin is promotable and
+// demotable by the owner or another admin; member is the default for anyone
+// who joins via an accepted invite.
 const (
 	GroupRoleOwner  = "owner"
+	GroupRoleAdmin  = "admin"
 	GroupRoleMember = "member"
 )
 
