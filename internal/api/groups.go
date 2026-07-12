@@ -32,7 +32,7 @@ type wrappedKeyPayload struct {
 // can recover the group key later); Members are contacts added directly at
 // creation, each with the key wrapped for them.
 type createGroupRequest struct {
-	Name    string `json:"name"`
+	Name    string            `json:"name"`
 	SelfKey wrappedKeyPayload `json:"self_key"`
 	Members []struct {
 		UserID string `json:"user_id"`
