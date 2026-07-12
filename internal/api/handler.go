@@ -203,6 +203,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Post("/groups/{id}/avatar", h.UploadGroupAvatar)
 			r.Post("/groups/{id}/members", h.AddGroupMember)
 			r.Put("/groups/{id}/members/{user_id}/role", h.UpdateMemberRole)
+			r.Delete("/groups/{id}/members/{user_id}", h.RemoveGroupMember)
 			r.Post("/groups/{id}/leave", h.LeaveGroup)
 			r.Get("/invites", h.ListInvites)
 			r.Post("/invites/accept", h.AcceptInvite)

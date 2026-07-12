@@ -116,6 +116,16 @@ type groupUpdateFrame struct {
 	Name string `json:"name,omitempty"`
 }
 
+// removedFromGroupFrame is delivered directly to a member an owner/admin just
+// removed. It has to be its own frame rather than riding on notifyGroupUpdated:
+// by the time that fans out to the remaining roster, the removed user isn't in
+// it anymore and would never otherwise learn they're gone.
+type removedFromGroupFrame struct {
+	Type      string `json:"type"`
+	GroupID   string `json:"group_id"`
+	GroupName string `json:"group_name"`
+}
+
 type inviteReceivedFrame struct {
 	Type      string `json:"type"`
 	InviteID  string `json:"invite_id"`
@@ -741,4 +751,90 @@ func (h *Handler) LeaveGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]bool{"left": true})
+}
+
+// RemoveGroupMember removes another member from the group. The owner and
+// admins may remove a regular member; only the owner may remove an admin (an
+// admin cannot remove a fellow admin) — the group's owner can never be
+// removed here at all, matching the immutable-owner rule UpdateMemberRole
+// already enforces. Removing yourself this way is rejected in favour of the
+// dedicated leave endpoint.
+//
+// This reuses db.LeaveGroup — the actual data operation (delete the member
+// row, hand off ownership or delete the group if it empties out) is identical
+// whether the departure is voluntary or not. Because the caller (an existing
+// owner/admin) always remains, the group is never deleted by a removal.
+func (h *Handler) RemoveGroupMember(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	groupID, ok := h.requireGroupAdmin(w, r, userID)
+	if !ok {
+		return
+	}
+
+	targetID, err := uuid.Parse(chi.URLParam(r, "user_id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid user id")
+		return
+	}
+	if targetID == userID {
+		writeError(w, http.StatusBadRequest, "use the leave endpoint to remove yourself")
+		return
+	}
+
+	targetRole, err := h.postgres.GetGroupMemberRole(r.Context(), groupID, targetID)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "that user is not a member of this group")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to verify target membership")
+		return
+	}
+	if targetRole == models.GroupRoleOwner {
+		writeError(w, http.StatusForbidden, "the group owner cannot be removed")
+		return
+	}
+	if targetRole == models.GroupRoleAdmin {
+		callerRole, err := h.postgres.GetGroupMemberRole(r.Context(), groupID, userID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to verify your membership")
+			return
+		}
+		if callerRole != models.GroupRoleOwner {
+			writeError(w, http.StatusForbidden, "only the group owner can remove an admin")
+			return
+		}
+	}
+
+	if _, err := h.postgres.LeaveGroup(r.Context(), groupID, targetID); err != nil {
+		if errors.Is(err, db.ErrNotGroupMember) {
+			writeError(w, http.StatusNotFound, "that user is not a member of this group")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to remove member")
+		return
+	}
+
+	if h.broadcaster != nil {
+		h.broadcaster.InvalidateGroup(groupID)
+	}
+
+	full, err := h.postgres.GetGroupWithMembers(r.Context(), groupID, userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load group")
+		return
+	}
+
+	h.notifyGroupUpdated(r.Context(), groupID)
+	h.deliverFrame(targetID, removedFromGroupFrame{
+		Type:      "removed_from_group",
+		GroupID:   groupID.String(),
+		GroupName: full.Group.Name,
+	})
+
+	writeJSON(w, http.StatusOK, toGroupDTO(full))
 }
