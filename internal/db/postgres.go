@@ -151,6 +151,7 @@ func (r *PostgresRepo) CreateUser(ctx context.Context, username, passwordHash, p
 		// from a deliberate false, so it would otherwise insert false.
 		ChatPinEnabled: true,
 		ChatPinType:    models.ChatPinRotating,
+		Status:         models.UserStatusActive,
 	}
 
 	if err := r.db.WithContext(ctx).Create(user).Error; err != nil {
@@ -337,24 +338,36 @@ func (r *PostgresRepo) GetUserByID(ctx context.Context, userID uuid.UUID) (*mode
 
 // GetPublicKey returns the E2EE public key for a user, used by peers before encrypting
 // messages, along with the user's avatar URL so the caller can show a real profile
-// picture for the peer rather than only initials.
+// picture for the peer rather than only initials, and their account status so a
+// caller with an existing conversation can reflect a deactivated/deleted peer.
 //
 // The chat PIN is single-sided: fetching a peer's key is never gated by the peer's
 // PIN. The current user unlocks the chat interface with their own PIN on the client
 // (verified via POST /api/user/verify-pin), so this simply returns the key.
-func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID) (string, *string, string, *time.Time, error) {
+//
+// A missing public key is only ErrRecordNotFound for an active/deactivated account
+// (one that simply hasn't published a key yet — new-chat lookups should 404). A
+// deleted account has its key wiped by DeleteUser, so an empty key there is expected
+// and still returns successfully: the caller needs the status to update an existing
+// conversation's UI even though there is no key left to encrypt new messages with.
+func (r *PostgresRepo) GetPublicKey(ctx context.Context, userID uuid.UUID) (string, *string, string, *time.Time, string, error) {
 	var user models.User
 	if err := r.db.WithContext(ctx).
-		Select("username", "display_name", "public_key", "avatar_url", "last_seen").
+		Select("username", "display_name", "public_key", "avatar_url", "last_seen", "status").
 		Where("user_id = ?", userID).
 		First(&user).Error; err != nil {
-		return "", nil, "", nil, err
+		return "", nil, "", nil, "", err
 	}
 
-	if user.PublicKey == nil || *user.PublicKey == "" {
-		return "", nil, "", nil, gorm.ErrRecordNotFound
+	hasKey := user.PublicKey != nil && *user.PublicKey != ""
+	if !hasKey && user.Status != models.UserStatusDeleted {
+		return "", nil, "", nil, "", gorm.ErrRecordNotFound
 	}
-	return *user.PublicKey, user.AvatarURL, displayNameOf(&user), user.LastSeen, nil
+	publicKey := ""
+	if hasKey {
+		publicKey = *user.PublicKey
+	}
+	return publicKey, user.AvatarURL, displayNameOf(&user), user.LastSeen, user.Status, nil
 }
 
 // displayNameOf returns a user's display name, falling back to the username when
@@ -403,16 +416,69 @@ func (r *PostgresRepo) UpdatePinSettings(ctx context.Context, userID uuid.UUID, 
 // SearchUsersByUsername performs a case-insensitive prefix search over usernames for
 // chat discovery. It returns full user records; callers must project only safe fields
 // (never CustomPin) into their responses. Results are capped by limit.
+//
+// Only active accounts are discoverable — a deactivated account shouldn't gain new
+// conversations while signed out of one, and a deleted account has nothing left worth
+// finding.
 func (r *PostgresRepo) SearchUsersByUsername(ctx context.Context, query string, limit int) ([]models.User, error) {
 	var users []models.User
 	if err := r.db.WithContext(ctx).
-		Where("username ILIKE ?", query+"%").
+		Where("username ILIKE ? AND status = ?", query+"%", models.UserStatusActive).
 		Order("username ASC").
 		Limit(limit).
 		Find(&users).Error; err != nil {
 		return nil, fmt.Errorf("search users by username: %w", err)
 	}
 	return users, nil
+}
+
+// DeactivateUser flips the account to "deactivated": it can no longer obtain a JWT
+// (see Login / GoogleCallback), but every column is left intact so the profile and
+// past messages keep displaying normally to peers (with a "Deactivated" badge) and
+// the account can be brought back by whatever reactivation path is added later.
+func (r *PostgresRepo) DeactivateUser(ctx context.Context, userID uuid.UUID) error {
+	result := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Update("status", models.UserStatusDeactivated)
+	if result.Error != nil {
+		return fmt.Errorf("deactivate user: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
+
+// DeleteUser soft-deletes the account: status becomes "deleted", every
+// personally-identifying column is scrubbed, and the account can never sign in again
+// (password hash and Google linkage are cleared too, so a re-registration under the
+// same email/Google account isn't blocked by this row). UserID and Username are left
+// untouched — UserID because DynamoDB messages key off it as an immutable foreign
+// key, Username because it still carries a unique index and nothing requires it back.
+// Existing peers resolve the account to "Deleted User" client-side from the status
+// field, not from these now-blank columns.
+func (r *PostgresRepo) DeleteUser(ctx context.Context, userID uuid.UUID) error {
+	result := r.db.WithContext(ctx).Model(&models.User{}).
+		Where("user_id = ?", userID).
+		Updates(map[string]interface{}{
+			"status":           models.UserStatusDeleted,
+			"display_name":     "",
+			"email":            nil,
+			"phone_number":     nil,
+			"avatar_url":       nil,
+			"google_id":        nil,
+			"password_hash":    nil,
+			"public_key":       nil,
+			"custom_pin":       nil,
+			"chat_pin_enabled": false,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("delete user: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
 }
 
 // PingPostgres verifies that the PostgreSQL connection is alive.

@@ -6,6 +6,7 @@ import (
 
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/api"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -57,6 +58,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	userID, err := uuid.Parse(claims.UserID)
 	if err != nil {
 		http.Error(w, "invalid token subject", http.StatusUnauthorized)
+		return
+	}
+
+	// A JWT issued before the account was deactivated/deleted stays cryptographically
+	// valid until it expires (VibeNet has no server-side token revocation), but it
+	// must not be able to open a fresh realtime session once the account can no
+	// longer log in — otherwise "cannot log in" wouldn't hold for the live chat path.
+	if status, err := h.apiHandler.UserStatus(r.Context(), userID); err != nil {
+		http.Error(w, "user not found", http.StatusUnauthorized)
+		return
+	} else if status != models.UserStatusActive {
+		http.Error(w, "account is deactivated or deleted", http.StatusForbidden)
 		return
 	}
 

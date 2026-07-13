@@ -102,6 +102,23 @@ func (h *Handler) GoogleCallback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// An existing account that has since been deactivated or deleted must not be
+	// able to mint a fresh session through Google either — the same rule Login
+	// enforces for password sign-in (see loginBlockedReason).
+	if msg, blocked := loginBlockedReason(user.Status); blocked {
+		if h.googleOAuth.FrontendURL != "" {
+			redirectURL := fmt.Sprintf(
+				"%s/login?error=%s",
+				strings.TrimRight(h.googleOAuth.FrontendURL, "/"),
+				url.QueryEscape(msg),
+			)
+			http.Redirect(w, r, redirectURL, http.StatusFound)
+			return
+		}
+		writeError(w, http.StatusForbidden, msg)
+		return
+	}
+
 	jwtToken, err := h.jwt.GenerateToken(user.UserID, user.Username)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate token")

@@ -80,10 +80,22 @@ func toUserSummary(user *models.User) userSummary {
 		AvatarURL:      user.AvatarURL,
 		ChatPinEnabled: user.ChatPinEnabled,
 		ChatPinType:    user.ChatPinType,
+		Status:         user.Status,
 	}
 }
 
 // ValidateToken exposes JWT validation for WebSocket upgrade authentication.
 func (h *Handler) ValidateToken(token string) (*auth.Claims, error) {
 	return h.jwt.ValidateToken(token)
+}
+
+// UserStatus exposes an account's lifecycle state for WebSocket upgrade
+// authentication — a valid-but-stale JWT (see DeactivateAccount) must not be able
+// to open a live connection once the account is deactivated or deleted.
+func (h *Handler) UserStatus(ctx context.Context, userID uuid.UUID) (string, error) {
+	user, err := h.postgres.GetUserByID(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	return user.Status, nil
 }

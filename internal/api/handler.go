@@ -108,6 +108,8 @@ type userSummary struct {
 	AvatarURL      *string `json:"avatar_url,omitempty"`
 	ChatPinEnabled bool    `json:"chat_pin_enabled"`
 	ChatPinType    string  `json:"chat_pin_type"`
+	// Status is the account lifecycle state — "active", "deactivated", or "deleted".
+	Status string `json:"status"`
 }
 
 type profileUpdateRequest struct {
@@ -123,6 +125,10 @@ type publicKeyResponse struct {
 	// LastSeen is unix milliseconds of the peer's last disconnect, so the client
 	// can show "last seen ..." when they're offline. Omitted if never recorded.
 	LastSeen *int64 `json:"last_seen,omitempty"`
+	// Status is the target account's lifecycle state — "active", "deactivated", or
+	// "deleted" — so a client with an existing conversation can reflect it (badge,
+	// disabled composer) without a separate lookup.
+	Status string `json:"status"`
 }
 
 // userUpdateBroadcast is pushed to every connected client when a user edits
@@ -187,6 +193,8 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 		r.Group(func(r chi.Router) {
 			r.Use(h.JWTAuthMiddleware)
 			r.Get("/user/me", h.GetMe)
+			r.Post("/user/deactivate", h.DeactivateAccount)
+			r.Delete("/user/delete", h.DeleteAccount)
 			r.Put("/user/profile", h.UpdateProfile)
 			r.Post("/user/avatar", h.UploadAvatar)
 			r.Put("/user/public-key", h.UpdatePublicKey)
@@ -312,6 +320,13 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Checked after the password so an attacker without valid credentials learns
+	// nothing about an account's lifecycle state.
+	if msg, blocked := loginBlockedReason(user.Status); blocked {
+		writeError(w, http.StatusForbidden, msg)
+		return
+	}
+
 	token, err := h.jwt.GenerateToken(user.UserID, user.Username)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to generate token")
@@ -322,6 +337,20 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		Token: token,
 		User:  toUserSummary(user),
 	})
+}
+
+// loginBlockedReason reports whether an account status should prevent a new JWT
+// from being issued, and if so, the message to surface. Shared by Login and
+// GoogleCallback so both authentication paths enforce the same lifecycle rule.
+func loginBlockedReason(status string) (message string, blocked bool) {
+	switch status {
+	case models.UserStatusDeactivated:
+		return "This account has been deactivated.", true
+	case models.UserStatusDeleted:
+		return "This account no longer exists.", true
+	default:
+		return "", false
+	}
 }
 
 // GetMe returns the authenticated user's current profile. The JWT only carries
@@ -345,6 +374,61 @@ func (h *Handler) GetMe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, toUserSummary(user))
+}
+
+// DeactivateAccount flips the authenticated account to "deactivated": it can no
+// longer sign in (see loginBlockedReason and the WebSocket handshake), but every
+// column — profile, messages, PIN settings — is left intact, so peers keep seeing
+// the account's name/avatar (the client shows a "Deactivated" badge) and it can be
+// brought back by a future reactivation path. Reversible, unlike DeleteAccount.
+//
+// The client that just called this clears its own session and redirects to /login;
+// the JWT already issued for this device stays cryptographically valid until it
+// expires (VibeNet issues stateless bearer tokens with no server-side revocation —
+// see JWTManager), but every future login attempt — from this device or any other —
+// is rejected from this point on.
+func (h *Handler) DeactivateAccount(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if err := h.postgres.DeactivateUser(r.Context(), userID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to deactivate account")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "account deactivated"})
+}
+
+// DeleteAccount permanently disables the authenticated account: status becomes
+// "deleted" and every PII column (real name, email, phone number, avatar, password
+// hash, Google linkage, chat PIN) is wiped — see PostgresRepo.DeleteUser. UserID is
+// never removed, so messages already stored in DynamoDB keep a valid sender_id; the
+// client resolves that id to "Deleted User" once it sees this account's status.
+// Unlike DeactivateAccount, there is no way back from this endpoint.
+func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	if err := h.postgres.DeleteUser(r.Context(), userID); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to delete account")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"message": "account deleted"})
 }
 
 // UpdateProfile edits the authenticated user's login username and display name
@@ -659,7 +743,7 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	publicKey, avatarURL, displayName, lastSeen, err := h.postgres.GetPublicKey(r.Context(), userID)
+	publicKey, avatarURL, displayName, lastSeen, status, err := h.postgres.GetPublicKey(r.Context(), userID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			writeError(w, http.StatusNotFound, "public key not found")
@@ -675,12 +759,21 @@ func (h *Handler) GetUserPublicKey(w http.ResponseWriter, r *http.Request) {
 		lastSeenMS = &ms
 	}
 
+	// A deleted account's display_name/avatar_url are already wiped (see DeleteUser),
+	// but display_name falls back to the still-intact username — override it here so
+	// a deleted account's former handle is never surfaced to a peer.
+	if status == models.UserStatusDeleted {
+		displayName = "Deleted User"
+		avatarURL = nil
+	}
+
 	writeJSON(w, http.StatusOK, publicKeyResponse{
 		UserID:      userID.String(),
 		DisplayName: displayName,
 		PublicKey:   publicKey,
 		AvatarURL:   avatarURL,
 		LastSeen:    lastSeenMS,
+		Status:      status,
 	})
 }
 

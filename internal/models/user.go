@@ -61,12 +61,26 @@ type User struct {
 	// CustomPin is the user's chosen 6-digit static PIN, used only when
 	// ChatPinType is "static". Nil until the user sets one. Never serialized.
 	CustomPin *string `gorm:"type:varchar(6)" json:"-"`
+
+	// Status is the account's lifecycle state (see the UserStatus* constants).
+	// Deactivated and deleted accounts can no longer obtain a JWT (see Login /
+	// GoogleCallback); a deleted account also has its PII columns wiped (see
+	// PostgresRepo.DeleteUser), leaving only this row's UserID as a stable
+	// foreign key for messages already stored in DynamoDB.
+	Status string `gorm:"type:varchar(16);not null;default:'active'" json:"status"`
 }
 
 // Chat PIN type values for ChatPinType.
 const (
 	ChatPinRotating = "rotating"
 	ChatPinStatic   = "static"
+)
+
+// Account lifecycle values for Status.
+const (
+	UserStatusActive      = "active"
+	UserStatusDeactivated = "deactivated"
+	UserStatusDeleted     = "deleted"
 )
 
 // TableName overrides the default GORM table name for the User model.
