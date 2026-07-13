@@ -100,15 +100,52 @@ sequenceDiagram
 
 ---
 
+### Diagram C — Group Creation & Invite Flow
+
+Group chats share one AES-256-GCM key, but the backend never sees it in the clear — only a `wrapped_key`/`key_nonce` pair per member, each encrypted client-side under that member's pairwise ECDH key (see [`internal/models/group.go`](internal/models/group.go)).
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant Owner as Group Owner (client)
+  participant API as Go REST API
+  participant PG as PostgreSQL
+  participant Invitee as Invitee (client)
+
+  Owner->>Owner: Generate random AES-256-GCM group key
+  Owner->>Owner: Wrap key per initial member<br/>(encrypt under pairwise ECDH key)
+  Owner->>API: POST /api/groups/create<br/>{ name, self_key, members: [wrapped_key, key_nonce] }
+  API->>PG: INSERT groups + group_members (role=owner/member)
+
+  Note over Owner,Invitee: Inviting someone after creation
+
+  Owner->>Owner: Wrap group key for invitee's public key
+  Owner->>API: POST /api/groups/{id}/members<br/>(direct add, wrapped key attached)
+  API->>PG: INSERT group_invites (status=pending, wrapped_key, key_nonce)
+  Invitee->>API: GET /api/invites
+  API-->>Invitee: Pending invite + wrapped key
+  Invitee->>API: POST /api/invites/accept
+  API->>PG: Copy wrapped_key/key_nonce onto new group_members row
+  Invitee->>Invitee: Unwrap with own private key<br/>→ usable AES-256-GCM group key
+```
+
+> **Server's view:** at every step, PostgreSQL persists ciphertext of the group key (`wrapped_key` + `key_nonce`) and who wrapped it (`wrapped_by`) — never the raw key, so the backend cannot decrypt group traffic even with full database access.
+
+---
+
 ## Key Features
 
-- **End-to-End Encryption (E2EE)** — Clients encrypt and decrypt locally; the server stores and forwards ciphertext exclusively.
+- **End-to-End Encryption (E2EE)** — Clients encrypt and decrypt locally over Web Crypto (ECDH P-256 + AES-256-GCM); the server stores and forwards ciphertext exclusively.
+- **Group Chats with Wrapped Keys** — Groups, roles (owner/admin/member), and an invite/accept/decline flow. The server never sees a group's plaintext key — only a `wrapped_key`/`key_nonce` pair per member, encrypted client-side under that member's pairwise ECDH key (see [`internal/models/group.go`](internal/models/group.go)).
 - **Google OAuth 2.0** — One-click sign-in with automatic user provisioning and deferred public-key upload.
 - **JWT Authentication** — Stateless bearer tokens secure REST endpoints and WebSocket upgrades.
-- **Dual-Database Strategy** — PostgreSQL (RDS) for users, contacts, and public keys; DynamoDB for encrypted message history.
-- **Anti-Spam Rotating PIN** — Users can mandate a 4-digit PIN (valid for 5 mins) required by strangers to initiate a chat.
+- **Dual-Database Strategy** — PostgreSQL (RDS) for users, contacts, groups, and public keys; DynamoDB for encrypted message history.
+- **Anti-Spam Rotating PIN** — Users can mandate a 4-digit PIN (valid for 5 mins) required by strangers to initiate a chat; peers verify it before the first DM.
+- **Encrypted Attachments via S3** — Presigned upload/download URLs so the backend brokers access without ever touching file bytes; the client encrypts before PUT and decrypts after GET.
+- **Avatar Uploads** — Per-user and per-group avatar images, served back as backend-relative paths.
+- **Account Lifecycle** — Self-service deactivation and permanent deletion endpoints.
 - **Concurrent WebSocket Routing** — Hub-based connection pooling with non-blocking `go func()` writes to DynamoDB alongside real-time delivery.
-- **Production-Ready Stack** — Chi router, CORS, bcrypt password hashing, GORM, and AWS SDK v2.
+- **Production-Ready Stack** — Chi router, CORS allow-listing, bcrypt password hashing, GORM, and AWS SDK v2.
 
 ---
 
@@ -122,14 +159,53 @@ sequenceDiagram
 | `POST` | `/api/auth/register` | — | Register with `username`, `password`, and E2EE `public_key` |
 | `POST` | `/api/auth/login` | — | Standard login — returns a signed JWT |
 | `GET` | `/api/auth/google/login` | — | Redirects to the Google OAuth consent screen |
-| `GET` | `/api/auth/google/callback` | — | Handles the OAuth callback and returns a JWT |
+| `GET` | `/api/auth/google/callback` | — | Handles the OAuth callback, provisions the user if new, and redirects to `<FRONTEND_URL>/auth/google-success?token=...` |
+
+**Account & profile**
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
 | `GET` | `/api/user/me` | JWT | Return the caller's current profile — `user_id`, `username`, `email`, `avatar_url` |
+| `POST` | `/api/user/deactivate` | JWT | Deactivate the caller's account (recoverable) |
+| `DELETE` | `/api/user/delete` | JWT | Permanently delete the caller's account |
 | `PUT` | `/api/user/profile` | JWT | Rename the caller — body `{ "username": "new_name" }`; `409` when taken |
+| `POST` | `/api/user/avatar` | JWT | Upload/replace the caller's avatar image |
 | `PUT` | `/api/user/public-key` | JWT | Upload or update the authenticated user's E2EE public key |
-| `PUT` | `/api/user/settings/pin-toggle` | JWT | Enable/disable the anti-spam chat PIN — body `{ "require_pin": true }` |
+| `PUT` | `/api/user/settings/pin` | JWT | Enable/disable the anti-spam chat PIN — body `{ "require_pin": true }` |
+| `POST` | `/api/user/verify-pin` | JWT | Verify the caller's own PIN (settings re-auth) |
 | `GET` | `/api/user/my-pin` | JWT | Return the caller's active 4-digit PIN (auto-refreshed if missing/expired) |
 | `GET` | `/api/users/search?username={uname}` | JWT | Search users by username; returns `user_id`, `username`, `require_pin` (never the PIN) |
 | `GET` | `/api/users/{id}/key?pin={pin}` | JWT | Fetch a user's public key; `pin` required when the target mandates a chat PIN |
+| `POST` | `/api/users/{id}/verify-pin` | JWT | Verify a peer's PIN before starting a DM with them |
+
+**Attachments**
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/api/upload/presigned-url` | JWT | Short-lived S3 `PUT` URL + object key for an encrypted attachment upload |
+| `GET` | `/api/upload/download-url` | JWT | Short-lived S3 `GET` URL to fetch an attachment's ciphertext back |
+
+**Messages**
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `GET` | `/api/messages/{chatRoomID}` | JWT | Catch-up history for a DM (`"<idA>-<idB>"`, sorted) or group (`"group:<id>"`) room |
+
+**Groups & invites**
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| `POST` | `/api/groups/create` | JWT | Create a group; caller becomes `owner`, plus optional directly-added members, each carrying their wrapped copy of the group key |
+| `GET` | `/api/groups` | JWT | List every group the caller belongs to, with roster and the caller's wrapped group key |
+| `PUT` | `/api/groups/{id}` | JWT | Rename a group (owner/admin only) |
+| `POST` | `/api/groups/{id}/avatar` | JWT | Upload/replace a group's avatar image (owner/admin only) |
+| `POST` | `/api/groups/{id}/members` | JWT | Add a member directly (owner/admin only), carrying that member's wrapped group key |
+| `PUT` | `/api/groups/{id}/members/{user_id}/role` | JWT | Promote/demote a member between `admin` and `member` (owner/admin only) |
+| `DELETE` | `/api/groups/{id}/members/{user_id}` | JWT | Remove a member from the group (owner/admin only) |
+| `POST` | `/api/groups/{id}/leave` | JWT | Leave a group; ownership transfers to the earliest-joined remaining member if the owner leaves |
+| `GET` | `/api/invites` | JWT | List the caller's pending group invites |
+| `POST` | `/api/invites/accept` | JWT | Accept a pending invite — the invite's wrapped key is copied onto a new `GroupMember` row |
+| `POST` | `/api/invites/decline` | JWT | Decline a pending invite |
 
 ### Health Check
 
@@ -247,7 +323,9 @@ Edit `.env` with your credentials. At minimum, set:
 | `AWS_REGION`, `DYNAMODB_MESSAGES_TABLE` | DynamoDB configuration |
 | `JWT_SECRET` | Token signing secret |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URL` | OAuth 2.0 |
+| `FRONTEND_URL` | Base origin of the SPA — after Google sign-in the backend redirects to `<FRONTEND_URL>/auth/google-success?token=...`. **Must match the real deployed frontend origin**, or OAuth users land on the wrong host |
 | `CORS_ALLOWED_ORIGINS` | Allowed frontend origins — **comma-separated** for multiple (e.g. `http://localhost:5173,https://vibenet.app`) |
+| `AWS_S3_*` | S3 bucket/region/credentials for encrypted attachment presigned URLs (optional — upload endpoints return `503` if unset) |
 | `APP_ENV`, `APP_VERSION` | Environment label and version string surfaced by `/health` (optional) |
 
 > **Tip:** For local DynamoDB, uncomment `DYNAMODB_ENDPOINT=http://localhost:8000` in `.env`.
@@ -284,7 +362,7 @@ connections for real-time chat, it needs an **always-on** host — an **EC2 `t3.
 
 > **Live endpoint:** the reference deployment runs at **`https://vibenet-api.duckdns.org`** — a free [DuckDNS](https://www.duckdns.org) subdomain pointed at the EC2 public IP, fronted by nginx with a Let's Encrypt certificate.
 
-### Diagram C — Production Topology (AWS EC2)
+### Diagram D — Production Topology (AWS EC2)
 
 ```mermaid
 flowchart LR
@@ -380,7 +458,7 @@ repo-root [`AWS_SETUP_GUIDE.md`](../AWS_SETUP_GUIDE.md).
 Two [GitHub Actions](.github/workflows/) workflows automate quality gates and delivery. A broken
 build **never** reaches the server — the deploy job runs only after CI succeeds on `main`.
 
-### Diagram D — Automated Build → Deploy Flow
+### Diagram E — Automated Build → Deploy Flow
 
 ```mermaid
 flowchart LR
