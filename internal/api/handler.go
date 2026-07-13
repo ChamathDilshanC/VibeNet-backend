@@ -18,6 +18,7 @@ import (
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/pin"
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/storage"
 	"github.com/ChamathDilshanC/VibeNet-backend/pkg/utils"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -52,10 +53,16 @@ type Handler struct {
 	// URL — the client prefixes its API origin, so the same value stays correct
 	// across dev/prod without a PUBLIC_BASE_URL to keep in sync.
 	avatarDir string
+	// s3 signs presigned upload/download URLs for E2EE file attachments (see
+	// upload.go). Nil when AWS_S3_* is unset — GetUploadURL/GetDownloadURL then
+	// answer 503 rather than panicking, the same graceful-degradation the
+	// Google OAuth fields already get when unconfigured.
+	s3 *storage.PresignClient
 }
 
 // NewHandler constructs an API handler with the required persistence and auth services.
-func NewHandler(postgres *db.PostgresRepo, dynamo *db.DynamoRepo, jwtManager *auth.JWTManager, googleCfg auth.GoogleOAuthConfig) *Handler {
+// s3Presign may be nil when file attachments aren't configured for this deployment.
+func NewHandler(postgres *db.PostgresRepo, dynamo *db.DynamoRepo, jwtManager *auth.JWTManager, googleCfg auth.GoogleOAuthConfig, s3Presign *storage.PresignClient) *Handler {
 	cfgCopy := googleCfg
 	// UPLOAD_DIR is the root served at "/uploads"; avatars live in its "avatars"
 	// subdirectory.
@@ -66,6 +73,7 @@ func NewHandler(postgres *db.PostgresRepo, dynamo *db.DynamoRepo, jwtManager *au
 		jwt:         jwtManager,
 		googleOAuth: &cfgCopy,
 		avatarDir:   filepath.Join(uploadDir, "avatars"),
+		s3:          s3Presign,
 	}
 }
 
@@ -197,6 +205,8 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Delete("/user/delete", h.DeleteAccount)
 			r.Put("/user/profile", h.UpdateProfile)
 			r.Post("/user/avatar", h.UploadAvatar)
+			r.Get("/upload/presigned-url", h.GetUploadURL)
+			r.Get("/upload/download-url", h.GetDownloadURL)
 			r.Put("/user/public-key", h.UpdatePublicKey)
 			r.Put("/user/settings/pin", h.UpdatePinSettings)
 			r.Post("/user/verify-pin", h.VerifyPin)

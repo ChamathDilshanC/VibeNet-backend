@@ -16,6 +16,7 @@ import (
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/api"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/auth"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
+	"github.com/ChamathDilshanC/VibeNet-backend/internal/storage"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/websocket"
 	"github.com/ChamathDilshanC/VibeNet-backend/pkg/utils"
 	"github.com/go-chi/chi/v5"
@@ -62,7 +63,16 @@ func main() {
 	jwtManager := auth.NewJWTManager()
 	googleCfg := auth.LoadGoogleOAuthConfig()
 
-	apiHandler := api.NewHandler(postgresRepo, dynamoRepo, jwtManager, googleCfg)
+	// S3 (encrypted file/image attachments) is optional: a deployment without
+	// AWS_S3_* configured still boots, just with the upload endpoints answering
+	// 503 rather than the whole server failing to start.
+	s3Presign, err := storage.NewPresignClient(ctx, storage.LoadS3Config())
+	if err != nil {
+		log.Printf("s3 attachments disabled: %v", err)
+		s3Presign = nil
+	}
+
+	apiHandler := api.NewHandler(postgresRepo, dynamoRepo, jwtManager, googleCfg, s3Presign)
 	wsHub := websocket.NewHub(postgresRepo)
 	// Let the REST layer push live profile updates (user_update) to connected
 	// clients. Wired after construction to avoid an api⇄websocket import cycle.
