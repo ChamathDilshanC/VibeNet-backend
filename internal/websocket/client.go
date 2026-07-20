@@ -478,6 +478,12 @@ func (c *Client) handleChatMessage(inbound inboundMessage) {
 			log.Printf("websocket: async dynamodb save failed for message %s: %v", messageID, err)
 		}
 	}(inbound.MessageID, inbound.ChatRoomID, c.userID.String(), inbound.Ciphertext, inbound.Nonce, inbound.Timestamp)
+
+	// Index both sides of the room so the receiver can discover it later even
+	// if they weren't connected just now to get it live (see
+	// Hub.RecordDMParticipants). Only needed once per room, but the upsert is
+	// idempotent so there's no reason to special-case "first message only".
+	go c.hub.RecordDMParticipants(inbound.ChatRoomID, c.userID, receiverID)
 }
 
 // trySend queues a control frame (ack/read) to this client without blocking:

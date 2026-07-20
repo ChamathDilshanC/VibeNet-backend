@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -96,6 +97,7 @@ func ConnectPostgres(cfg PostgresConfig) (*gorm.DB, error) {
 		&models.Group{},
 		&models.GroupMember{},
 		&models.GroupInvite{},
+		&models.DMParticipant{},
 	); err != nil {
 		return nil, fmt.Errorf("auto-migrate postgres schema: %w", err)
 	}
@@ -430,6 +432,57 @@ func (r *PostgresRepo) SearchUsersByUsername(ctx context.Context, query string, 
 		return nil, fmt.Errorf("search users by username: %w", err)
 	}
 	return users, nil
+}
+
+// RecordDMParticipants idempotently indexes both sides of a direct-message
+// room so either participant's client can later discover it — see
+// ListDiscoverableDMs. Safe to call on every message sent in the room:
+// ON CONFLICT DO NOTHING makes repeat calls for an already-known room a
+// no-op.
+func (r *PostgresRepo) RecordDMParticipants(ctx context.Context, chatRoomID string, userA, userB uuid.UUID) error {
+	rows := []models.DMParticipant{
+		{ChatRoomID: chatRoomID, UserID: userA, PeerID: userB},
+		{ChatRoomID: chatRoomID, UserID: userB, PeerID: userA},
+	}
+	if err := r.db.WithContext(ctx).
+		Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&rows).Error; err != nil {
+		return fmt.Errorf("record dm participants: %w", err)
+	}
+	return nil
+}
+
+// DiscoverableDM is one row of ListDiscoverableDMs: a DM room the queried
+// user is a participant in, joined with enough of the peer's profile for the
+// caller to materialize a full local conversation without a second round
+// trip per peer.
+type DiscoverableDM struct {
+	ChatRoomID  string
+	PeerID      uuid.UUID
+	Username    string
+	DisplayName string
+	AvatarURL   *string
+	PublicKey   *string
+	Status      string
+}
+
+// ListDiscoverableDMs lists every DM room userID is a participant in per the
+// server-side index (see RecordDMParticipants), newest first. This is the
+// catch-up path for a first-contact conversation someone else opened while
+// this user's device was offline — the WebSocket hub only delivers live and
+// there is otherwise no server-side "conversations" list at all.
+func (r *PostgresRepo) ListDiscoverableDMs(ctx context.Context, userID uuid.UUID) ([]DiscoverableDM, error) {
+	var rows []DiscoverableDM
+	if err := r.db.WithContext(ctx).
+		Table("dm_participants AS dm").
+		Select("dm.chat_room_id AS chat_room_id, dm.peer_id AS peer_id, u.username AS username, u.display_name AS display_name, u.avatar_url AS avatar_url, u.public_key AS public_key, u.status AS status").
+		Joins("JOIN users u ON u.user_id = dm.peer_id").
+		Where("dm.user_id = ?", userID).
+		Order("dm.created_at DESC").
+		Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("list discoverable dms: %w", err)
+	}
+	return rows, nil
 }
 
 // DeactivateUser flips the account to "deactivated": it can no longer obtain a JWT

@@ -215,6 +215,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 			r.Get("/users/{id}/key", h.GetUserPublicKey)
 			r.Post("/users/{id}/verify-pin", h.VerifyPeerPin)
 			r.Get("/messages/{chatRoomID}", h.GetChatHistory)
+			r.Get("/conversations/discover", h.GetDiscoverableConversations)
 			r.Post("/groups/create", h.CreateGroup)
 			r.Get("/groups", h.ListGroups)
 			r.Put("/groups/{id}", h.UpdateGroup)
@@ -1079,6 +1080,55 @@ func (h *Handler) GetChatHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"messages": dtos})
+}
+
+// discoverableConversationDTO is one row returned by GetDiscoverableConversations —
+// enough of the peer's profile for the client to materialize a full local
+// conversation (see conversations.ts) without a second round trip per peer.
+type discoverableConversationDTO struct {
+	ChatRoomID  string  `json:"chat_room_id"`
+	PeerID      string  `json:"peer_id"`
+	Username    string  `json:"username"`
+	DisplayName string  `json:"display_name"`
+	AvatarURL   *string `json:"avatar_url,omitempty"`
+	PublicKey   *string `json:"public_key,omitempty"`
+	Status      string  `json:"status"`
+}
+
+// GetDiscoverableConversations lists every direct-message room the caller is a
+// participant in per the server-side index (see PostgresRepo.RecordDMParticipants),
+// so a client can surface a first-contact conversation someone else opened while
+// this device was offline. The WebSocket hub only delivers live and there is
+// otherwise no server-side "conversations" list at all — a DM is normally just
+// two user IDs and a client-side cache (see conversations.ts on the frontend).
+// The client is expected to diff this against its local cache and only
+// materialize entries it doesn't already have.
+func (h *Handler) GetDiscoverableConversations(w http.ResponseWriter, r *http.Request) {
+	userID, ok := UserIDFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	rows, err := h.postgres.ListDiscoverableDMs(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list conversations")
+		return
+	}
+
+	dtos := make([]discoverableConversationDTO, 0, len(rows))
+	for _, row := range rows {
+		dtos = append(dtos, discoverableConversationDTO{
+			ChatRoomID:  row.ChatRoomID,
+			PeerID:      row.PeerID.String(),
+			Username:    row.Username,
+			DisplayName: row.DisplayName,
+			AvatarURL:   row.AvatarURL,
+			PublicKey:   row.PublicKey,
+			Status:      row.Status,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"conversations": dtos})
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {

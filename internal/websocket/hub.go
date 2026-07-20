@@ -222,6 +222,25 @@ func (h *Hub) InvalidateGroup(groupID uuid.UUID) {
 	h.groupMembersMu.Unlock()
 }
 
+// RecordDMParticipants indexes a direct-message room's two participants in
+// Postgres so each side's client can later discover the room even if it
+// wasn't connected when the other side sent the opening message — see
+// PostgresRepo.ListDiscoverableDMs and GetDiscoverableConversations. Meant to
+// be called from a goroutine (like the caller's DynamoDB save): best-effort
+// and non-blocking, since a failure here only degrades that catch-up path,
+// not delivery of the message itself. No-op when the hub has no Postgres
+// handle (tests).
+func (h *Hub) RecordDMParticipants(chatRoomID string, userA, userB uuid.UUID) {
+	if h.postgres == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.postgres.RecordDMParticipants(ctx, chatRoomID, userA, userB); err != nil {
+		log.Printf("websocket: failed to index dm participants for room %s: %v", chatRoomID, err)
+	}
+}
+
 // IsGroupMemberCached reports whether userID is in the group's (possibly
 // cached) member list — the authorization check for inbound group frames.
 func (h *Hub) IsGroupMemberCached(groupID, userID uuid.UUID) bool {
