@@ -1,0 +1,25 @@
+name: Keep Alive
+
+# Pings the Render-hosted backend's /health endpoint on a schedule to stop
+# two free-tier providers from going idle:
+#   - Render spins down a free web service after ~15 min with no inbound
+#     HTTP traffic (cold start of 30-50s on the next real request).
+#   - Supabase auto-pauses a free-tier project after 7 days with no
+#     database activity — /health's Postgres ping (see cmd/api/main.go)
+#     covers this too, so one ping serves both.
+#
+# GitHub disables scheduled workflows after 60 days without any commit to
+# the repo. An actively developed repo won't hit that, but it's a real
+# limitation of doing this via Actions cron instead of an external pinger.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    name: Ping backend /health
+    runs-on: ubuntu-latest
+    steps:
+      - name: curl /health
+        run: curl --fail --silent --show-error --max-time 60 --retry 2 --retry-delay 10 https://vibenet-backend-e352.onrender.com/health
