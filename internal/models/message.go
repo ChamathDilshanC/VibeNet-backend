@@ -1,17 +1,20 @@
 package models
 
-// Message represents an encrypted chat message stored in Amazon DynamoDB.
-// The backend acts as a blind router: only ciphertext and cryptographic metadata
-// are persisted; plain-text content never reaches the server.
+// Message is an encrypted chat message. The backend acts as a blind router:
+// only ciphertext and cryptographic metadata are persisted, plain-text
+// content never reaches the server.
+//
+// ChatRoomID + Timestamp form the primary key, mirroring the partition/sort
+// key design of the DynamoDB table this replaced — a repeat SaveMessage call
+// with the same pair overwrites in place (see MessageRepo.SaveMessage's
+// upsert), rather than introducing a new uniqueness constraint on MessageID
+// that didn't exist before.
 type Message struct {
-	// ChatRoomID is the DynamoDB partition key (chat room or sender/receiver pair).
-	ChatRoomID string `dynamodbav:"chat_room_id" json:"chat_room_id"`
+	ChatRoomID string `gorm:"column:chat_room_id;primaryKey" json:"chat_room_id"`
+	Timestamp  int64  `gorm:"column:timestamp;primaryKey" json:"timestamp"`
 
-	// Timestamp is the DynamoDB sort key, stored as a Unix epoch in milliseconds.
-	Timestamp int64 `dynamodbav:"timestamp" json:"timestamp"`
-
-	MessageID  string `dynamodbav:"message_id" json:"message_id"`
-	SenderID   string `dynamodbav:"sender_id" json:"sender_id"`
-	Ciphertext string `dynamodbav:"ciphertext" json:"ciphertext"`
-	Nonce      string `dynamodbav:"nonce" json:"nonce"`
+	MessageID  string `gorm:"column:message_id;index" json:"message_id"`
+	SenderID   string `gorm:"column:sender_id" json:"sender_id"`
+	Ciphertext string `gorm:"column:ciphertext" json:"ciphertext"`
+	Nonce      string `gorm:"column:nonce" json:"nonce"`
 }

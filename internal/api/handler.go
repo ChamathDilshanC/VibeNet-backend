@@ -7,8 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,7 +17,6 @@ import (
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/models"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/pin"
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/storage"
-	"github.com/ChamathDilshanC/VibeNet-backend/pkg/utils"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
@@ -43,37 +40,33 @@ type Broadcaster interface {
 // Handler groups REST dependencies for auth and user routes.
 type Handler struct {
 	postgres    *db.PostgresRepo
-	dynamo      *db.DynamoRepo
+	messages    *db.MessageRepo
 	jwt         *auth.JWTManager
 	googleOAuth *auth.GoogleOAuthConfig
 	broadcaster Broadcaster
-	// avatarDir is the filesystem directory uploaded avatars are written to; it is
-	// served publicly at "/uploads/avatars/" (see cmd/api/main.go). The stored
-	// avatar_url is the backend-relative path under that route, not an absolute
-	// URL — the client prefixes its API origin, so the same value stays correct
-	// across dev/prod without a PUBLIC_BASE_URL to keep in sync.
-	avatarDir string
 	// s3 signs presigned upload/download URLs for E2EE file attachments (see
-	// upload.go). Nil when AWS_S3_* is unset — GetUploadURL/GetDownloadURL then
-	// answer 503 rather than panicking, the same graceful-degradation the
+	// upload.go). Nil when SUPABASE_S3_* is unset — GetUploadURL/GetDownloadURL
+	// then answer 503 rather than panicking, the same graceful-degradation the
 	// Google OAuth fields already get when unconfigured.
 	s3 *storage.PresignClient
+	// avatarStore uploads profile/group photos to Supabase Storage's
+	// S3-compatible API (see storage/avatars.go). Nil when SUPABASE_S3_* is
+	// unset — storeUploadedAvatar then answers 503 rather than panicking.
+	avatarStore *storage.AvatarStore
 }
 
 // NewHandler constructs an API handler with the required persistence and auth services.
-// s3Presign may be nil when file attachments aren't configured for this deployment.
-func NewHandler(postgres *db.PostgresRepo, dynamo *db.DynamoRepo, jwtManager *auth.JWTManager, googleCfg auth.GoogleOAuthConfig, s3Presign *storage.PresignClient) *Handler {
+// s3Presign and avatarStore may be nil when file attachments or avatar uploads
+// respectively aren't configured for this deployment.
+func NewHandler(postgres *db.PostgresRepo, messages *db.MessageRepo, jwtManager *auth.JWTManager, googleCfg auth.GoogleOAuthConfig, s3Presign *storage.PresignClient, avatarStore *storage.AvatarStore) *Handler {
 	cfgCopy := googleCfg
-	// UPLOAD_DIR is the root served at "/uploads"; avatars live in its "avatars"
-	// subdirectory.
-	uploadDir := utils.GetEnv("UPLOAD_DIR", "./public/uploads")
 	return &Handler{
 		postgres:    postgres,
-		dynamo:      dynamo,
+		messages:    messages,
 		jwt:         jwtManager,
 		googleOAuth: &cfgCopy,
-		avatarDir:   filepath.Join(uploadDir, "avatars"),
 		s3:          s3Presign,
+		avatarStore: avatarStore,
 	}
 }
 
@@ -420,8 +413,8 @@ func (h *Handler) DeactivateAccount(w http.ResponseWriter, r *http.Request) {
 // DeleteAccount permanently disables the authenticated account: status becomes
 // "deleted" and every PII column (real name, email, phone number, avatar, password
 // hash, Google linkage, chat PIN) is wiped — see PostgresRepo.DeleteUser. UserID is
-// never removed, so messages already stored in DynamoDB keep a valid sender_id; the
-// client resolves that id to "Deleted User" once it sees this account's status.
+// never removed, so already-stored messages keep a valid sender_id; the client
+// resolves that id to "Deleted User" once it sees this account's status.
 // Unlike DeactivateAccount, there is no way back from this endpoint.
 func (h *Handler) DeleteAccount(w http.ResponseWriter, r *http.Request) {
 	userID, ok := UserIDFromContext(r.Context())
@@ -536,15 +529,21 @@ var allowedAvatarTypes = map[string]string{
 	"image/gif":  ".gif",
 }
 
-// storeUploadedAvatar validates and persists a multipart image upload (the
-// "avatar" field) under a random UUID filename in the avatars directory. It
-// writes the error response itself on failure (ok=false); on success it
-// returns the public backend-relative URL and the on-disk path so the caller
-// can clean up if its own DB write fails. Shared by the user-profile and
-// group-photo upload endpoints.
-func (h *Handler) storeUploadedAvatar(w http.ResponseWriter, r *http.Request) (avatarURL, dstPath string, ok bool) {
+// storeUploadedAvatar validates a multipart image upload (the "avatar"
+// field) and uploads it to Supabase Storage under a random UUID key prefixed
+// with keyPrefix ("users/" or "groups/", keeping the two kinds separated
+// within the shared avatars bucket). It writes the error response itself on
+// failure (ok=false); on success it returns the object's public URL and its
+// storage key so the caller can delete it if its own DB write fails. Shared
+// by the user-profile and group-photo upload endpoints.
+func (h *Handler) storeUploadedAvatar(w http.ResponseWriter, r *http.Request, keyPrefix string) (avatarURL, objectKey string, ok bool) {
+	if h.avatarStore == nil {
+		writeError(w, http.StatusServiceUnavailable, "avatar uploads are not configured")
+		return "", "", false
+	}
+
 	// Cap the request body before parsing so an oversized upload is rejected
-	// without buffering it all into memory or disk.
+	// without buffering it all into memory.
 	r.Body = http.MaxBytesReader(w, r.Body, maxAvatarBytes)
 	if err := r.ParseMultipartForm(maxAvatarBytes); err != nil {
 		writeError(w, http.StatusBadRequest, "image is too large (max 5 MB) or the upload was malformed")
@@ -573,40 +572,22 @@ func (h *Handler) storeUploadedAvatar(w http.ResponseWriter, r *http.Request) (a
 		return "", "", false
 	}
 
-	if err := os.MkdirAll(h.avatarDir, 0o755); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to store image")
-		return "", "", false
-	}
-	// The filename is a fresh UUID plus the vetted extension — no user input reaches
-	// the path, so there is nothing to traverse out of the avatars directory.
-	filename := uuid.NewString() + ext
-	dstPath = filepath.Join(h.avatarDir, filename)
-	dst, err := os.Create(dstPath)
+	// The key is a fresh UUID plus the vetted extension — no user input reaches
+	// it, so there is nothing to traverse out of the bucket.
+	objectKey = keyPrefix + uuid.NewString() + ext
+	avatarURL, err = h.avatarStore.Upload(r.Context(), objectKey, file, contentType)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to store image")
 		return "", "", false
 	}
-	if _, err := io.Copy(dst, file); err != nil {
-		dst.Close()
-		os.Remove(dstPath)
-		writeError(w, http.StatusInternalServerError, "failed to store image")
-		return "", "", false
-	}
-	if err := dst.Close(); err != nil {
-		os.Remove(dstPath)
-		writeError(w, http.StatusInternalServerError, "failed to store image")
-		return "", "", false
-	}
 
-	// Return a backend-relative path; the client prefixes its API origin when it
-	// loads the image. This keeps the value portable across environments.
-	return "/uploads/avatars/" + filename, dstPath, true
+	return avatarURL, objectKey, true
 }
 
 // UploadAvatar accepts a multipart/form-data image under the "avatar" field,
-// stores it under a random UUID filename in the avatars directory, points the
-// user's avatar_url at the public URL, and broadcasts the change so every peer's
-// chat UI refreshes the picture live. It returns the updated profile summary.
+// uploads it to Supabase Storage, points the user's avatar_url at the public
+// URL, and broadcasts the change so every peer's chat UI refreshes the
+// picture live. It returns the updated profile summary.
 func (h *Handler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
 	userID, ok := UserIDFromContext(r.Context())
 	if !ok {
@@ -614,15 +595,15 @@ func (h *Handler) UploadAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	avatarURL, dstPath, ok := h.storeUploadedAvatar(w, r)
+	avatarURL, objectKey, ok := h.storeUploadedAvatar(w, r, "users/")
 	if !ok {
 		return
 	}
 
 	user, err := h.postgres.UpdateAvatarURL(r.Context(), userID, avatarURL)
 	if err != nil {
-		// Don't leave an orphaned file behind if the DB write fails.
-		os.Remove(dstPath)
+		// Don't leave an orphaned object behind if the DB write fails.
+		h.avatarStore.Delete(r.Context(), objectKey)
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			writeError(w, http.StatusNotFound, "user not found")
 			return
@@ -1062,7 +1043,7 @@ func (h *Handler) GetChatHistory(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	messages, err := h.dynamo.GetMessages(r.Context(), chatRoomID, limit)
+	messages, err := h.messages.GetMessages(r.Context(), chatRoomID, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to fetch message history")
 		return

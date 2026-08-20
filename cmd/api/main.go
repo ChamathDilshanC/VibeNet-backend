@@ -45,39 +45,40 @@ func main() {
 	}
 	log.Println("postgresql connection established")
 
-	dynamoCfg := db.LoadDynamoDBConfig()
-	dynamoClient, err := db.ConnectDynamoDB(ctx, dynamoCfg)
-	if err != nil {
-		log.Fatalf("dynamodb initialization failed: %v", err)
-	}
-	defer db.CloseDynamoDB(dynamoClient)
-
-	if err := db.PingDynamoDB(ctx, dynamoClient, db.MessagesTableName(dynamoCfg)); err != nil {
-		log.Printf("dynamodb health check warning: %v", err)
-	} else {
-		log.Println("dynamodb connection established")
-	}
-
 	postgresRepo := db.NewPostgresRepo(postgresDB)
-	dynamoRepo := db.NewDynamoRepo(dynamoClient, db.MessagesTableName(dynamoCfg))
+	// Messages share the same Postgres connection as the rest of VibeNet's
+	// relational data — no separate connection/credentials needed (this used
+	// to be a DynamoDB table; see internal/db/messages.go).
+	messageRepo := db.NewMessageRepo(postgresDB)
 	jwtManager := auth.NewJWTManager()
 	googleCfg := auth.LoadGoogleOAuthConfig()
 
-	// S3 (encrypted file/image attachments) is optional: a deployment without
-	// AWS_S3_* configured still boots, just with the upload endpoints answering
-	// 503 rather than the whole server failing to start.
+	// S3-compatible storage (encrypted file/image attachments, via Supabase
+	// Storage) is optional: a deployment without SUPABASE_S3_* configured
+	// still boots, just with the upload endpoints answering 503 rather than
+	// the whole server failing to start.
 	s3Presign, err := storage.NewPresignClient(ctx, storage.LoadS3Config())
 	if err != nil {
 		log.Printf("s3 attachments disabled: %v", err)
 		s3Presign = nil
 	}
 
-	apiHandler := api.NewHandler(postgresRepo, dynamoRepo, jwtManager, googleCfg, s3Presign)
+	// Avatar uploads (profile/group photos) go to Supabase Storage's
+	// S3-compatible API. Optional like s3Presign: a deployment without
+	// SUPABASE_S3_* configured still boots, just with upload endpoints
+	// answering 503.
+	avatarStore, err := storage.NewAvatarStore(ctx, storage.LoadAvatarStoreConfig())
+	if err != nil {
+		log.Printf("avatar uploads disabled: %v", err)
+		avatarStore = nil
+	}
+
+	apiHandler := api.NewHandler(postgresRepo, messageRepo, jwtManager, googleCfg, s3Presign, avatarStore)
 	wsHub := websocket.NewHub(postgresRepo)
 	// Let the REST layer push live profile updates (user_update) to connected
 	// clients. Wired after construction to avoid an api⇄websocket import cycle.
 	apiHandler.SetBroadcaster(wsHub)
-	wsHandler := websocket.NewHandler(wsHub, apiHandler, dynamoRepo)
+	wsHandler := websocket.NewHandler(wsHub, apiHandler, messageRepo)
 
 	router := chi.NewRouter()
 	router.Use(middleware.RequestID)
@@ -136,11 +137,10 @@ func main() {
 			return result
 		}
 
+		// Messages live on this same postgres connection now, so there's no
+		// separate "dynamodb" entry to check anymore.
 		services := map[string]serviceHealth{
 			"postgres": check(func() error { return db.PingPostgres(healthCtx, postgresDB) }),
-			"dynamodb": check(func() error {
-				return db.PingDynamoDB(healthCtx, dynamoClient, db.MessagesTableName(dynamoCfg))
-			}),
 		}
 
 		healthy := true
@@ -185,15 +185,12 @@ func main() {
 
 	apiHandler.RegisterRoutes(router)
 
-	// Serve uploaded files (currently avatars) from disk. UPLOAD_DIR is the root the
-	// /uploads path maps to; the avatar handler writes into its "avatars" subdir and
-	// returns URLs under this prefix. Kept in sync with NewHandler's UPLOAD_DIR read.
-	uploadDir := utils.GetEnv("UPLOAD_DIR", "./public/uploads")
-	router.Handle("/uploads/*", http.StripPrefix("/uploads/", http.FileServer(http.Dir(uploadDir))))
-
 	router.Get("/ws", wsHandler.ServeHTTP)
 
-	port := utils.GetEnv("APP_PORT", "8080")
+	// Render (and most PaaS hosts) assign the listen port via $PORT and route
+	// traffic to whatever it resolves to, ignoring app-specific env vars — so
+	// PORT must win when set, with APP_PORT as the local-dev fallback.
+	port := utils.GetEnv("PORT", utils.GetEnv("APP_PORT", "8080"))
 	server := &http.Server{
 		Addr:         ":" + port,
 		Handler:      router,

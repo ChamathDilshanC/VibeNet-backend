@@ -1,17 +1,17 @@
-// Package storage generates presigned Amazon S3 URLs for VibeNet's encrypted
-// file/image attachments. The Go backend never sees plaintext file bytes and
-// never proxies uploads or downloads itself — it only signs short-lived URLs
-// that let the browser PUT/GET directly against S3, so the server and any
-// database admin can only ever observe ciphertext (see internal/api/upload.go
-// for how those bytes get end-to-end encrypted client-side before this is
-// ever reached).
+// Package storage generates presigned URLs against Supabase Storage's
+// S3-compatible API for VibeNet's encrypted file/image attachments. The Go
+// backend never sees plaintext file bytes and never proxies uploads or
+// downloads itself — it only signs short-lived URLs that let the browser
+// PUT/GET directly against the bucket, so the server and any database admin
+// can only ever observe ciphertext (see internal/api/upload.go for how those
+// bytes get end-to-end encrypted client-side before this is ever reached).
 //
-// Deliberately configured from its own AWS_S3_* environment variables rather
-// than the AWS_REGION/AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY vars — those are
-// reserved for DynamoDB (see internal/db/dynamodb.go) and resolved via the
-// SDK's default credential chain. S3 uses a separate IAM identity, loaded
-// explicitly as static credentials so the two never collide or fall back on
-// each other.
+// Shares its SUPABASE_S3_* endpoint/region/credentials with the avatar store
+// (see avatars.go) — both are the same project-scoped Supabase S3 access key,
+// differing only in which bucket they target. The attachments bucket must
+// stay private (unlike the public avatars bucket): reads go through
+// PresignGetURL, never a public URL, since attachments are ciphertext meant
+// only for the intended recipient.
 package storage
 
 import (
@@ -26,10 +26,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// S3Config holds the connection parameters for the attachments bucket, loaded
-// from the AWS_S3_* environment variables (never AWS_REGION/AWS_ACCESS_KEY_ID
-// /AWS_SECRET_ACCESS_KEY — see the package doc).
+// S3Config holds the connection parameters for the attachments bucket. The
+// endpoint/region/credentials are the same Supabase S3 access key used for
+// avatars (see AvatarStoreConfig); only the bucket name differs.
 type S3Config struct {
+	Endpoint        string // e.g. https://<project-ref>.supabase.co/storage/v1/s3
 	Region          string
 	AccessKeyID     string
 	SecretAccessKey string
@@ -41,16 +42,17 @@ type S3Config struct {
 // credentials should still boot, just with file uploads disabled.
 func LoadS3Config() S3Config {
 	return S3Config{
-		Region:          utils.GetEnv("AWS_S3_REGION", ""),
-		AccessKeyID:     utils.GetEnv("AWS_S3_ACCESS_KEY_ID", ""),
-		SecretAccessKey: utils.GetEnv("AWS_S3_SECRET_ACCESS_KEY", ""),
-		BucketName:      utils.GetEnv("AWS_S3_BUCKET_NAME", ""),
+		Endpoint:        utils.GetEnv("SUPABASE_S3_ENDPOINT", ""),
+		Region:          utils.GetEnv("SUPABASE_S3_REGION", ""),
+		AccessKeyID:     utils.GetEnv("SUPABASE_S3_ACCESS_KEY_ID", ""),
+		SecretAccessKey: utils.GetEnv("SUPABASE_S3_SECRET_ACCESS_KEY", ""),
+		BucketName:      utils.GetEnv("SUPABASE_S3_ATTACHMENTS_BUCKET", "chat-attachments"),
 	}
 }
 
 // IsConfigured reports whether every field needed to sign a request is set.
 func (c S3Config) IsConfigured() bool {
-	return c.Region != "" && c.AccessKeyID != "" && c.SecretAccessKey != "" && c.BucketName != ""
+	return c.Endpoint != "" && c.Region != "" && c.AccessKeyID != "" && c.SecretAccessKey != "" && c.BucketName != ""
 }
 
 // PresignClient wraps an S3 presign client with the target bucket name.
@@ -59,13 +61,12 @@ type PresignClient struct {
 	bucket string
 }
 
-// NewPresignClient builds a PresignClient from static S3 credentials — not
-// the default credential chain, which would resolve DynamoDB's credentials
-// instead (see the package doc). Returns an error if cfg is incomplete;
-// callers should treat that as "uploads unavailable", not a fatal boot error.
+// NewPresignClient builds a PresignClient from static Supabase S3 credentials.
+// Returns an error if cfg is incomplete; callers should treat that as
+// "uploads unavailable", not a fatal boot error.
 func NewPresignClient(ctx context.Context, cfg S3Config) (*PresignClient, error) {
 	if !cfg.IsConfigured() {
-		return nil, fmt.Errorf("s3 is not configured: AWS_S3_REGION, AWS_S3_ACCESS_KEY_ID, AWS_S3_SECRET_ACCESS_KEY, and AWS_S3_BUCKET_NAME are all required")
+		return nil, fmt.Errorf("s3 is not configured: SUPABASE_S3_ENDPOINT, SUPABASE_S3_REGION, SUPABASE_S3_ACCESS_KEY_ID, SUPABASE_S3_SECRET_ACCESS_KEY, and SUPABASE_S3_ATTACHMENTS_BUCKET are all required")
 	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
@@ -78,7 +79,12 @@ func NewPresignClient(ctx context.Context, cfg S3Config) (*PresignClient, error)
 		return nil, fmt.Errorf("load s3 aws config: %w", err)
 	}
 
-	client := s3.NewFromConfig(awsCfg)
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.BaseEndpoint = aws.String(cfg.Endpoint)
+		// Supabase's S3-compatible API isn't *.amazonaws.com virtual-hosted
+		// style — it requires path-style bucket addressing.
+		o.UsePathStyle = true
+	})
 	return &PresignClient{
 		client: s3.NewPresignClient(client),
 		bucket: cfg.BucketName,

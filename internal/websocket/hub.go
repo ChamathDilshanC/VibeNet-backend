@@ -226,7 +226,7 @@ func (h *Hub) InvalidateGroup(groupID uuid.UUID) {
 // Postgres so each side's client can later discover the room even if it
 // wasn't connected when the other side sent the opening message — see
 // PostgresRepo.ListDiscoverableDMs and GetDiscoverableConversations. Meant to
-// be called from a goroutine (like the caller's DynamoDB save): best-effort
+// be called from a goroutine (like the caller's message save): best-effort
 // and non-blocking, since a failure here only degrades that catch-up path,
 // not delivery of the message itself. No-op when the hub has no Postgres
 // handle (tests).

@@ -66,7 +66,7 @@ type User struct {
 	// Deactivated and deleted accounts can no longer obtain a JWT (see Login /
 	// GoogleCallback); a deleted account also has its PII columns wiped (see
 	// PostgresRepo.DeleteUser), leaving only this row's UserID as a stable
-	// foreign key for messages already stored in DynamoDB.
+	// foreign key for already-stored messages.
 	Status string `gorm:"type:varchar(16);not null;default:'active'" json:"status"`
 }
 

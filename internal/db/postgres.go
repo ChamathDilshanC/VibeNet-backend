@@ -1,6 +1,6 @@
-// Package db provides database connection and lifecycle management for VibeNet.
-// It implements the dual-database strategy: PostgreSQL for relational metadata
-// and Amazon DynamoDB for high-volume encrypted message storage.
+// Package db provides database connection and lifecycle management for
+// VibeNet. All persistence — relational metadata and encrypted message
+// history alike — lives in one PostgreSQL database.
 package db
 
 import (
@@ -98,6 +98,7 @@ func ConnectPostgres(cfg PostgresConfig) (*gorm.DB, error) {
 		&models.GroupMember{},
 		&models.GroupInvite{},
 		&models.DMParticipant{},
+		&models.Message{},
 	); err != nil {
 		return nil, fmt.Errorf("auto-migrate postgres schema: %w", err)
 	}
@@ -506,8 +507,8 @@ func (r *PostgresRepo) DeactivateUser(ctx context.Context, userID uuid.UUID) err
 // personally-identifying column is scrubbed, and the account can never sign in again
 // (password hash and Google linkage are cleared too, so a re-registration under the
 // same email/Google account isn't blocked by this row). UserID and Username are left
-// untouched — UserID because DynamoDB messages key off it as an immutable foreign
-// key, Username because it still carries a unique index and nothing requires it back.
+// untouched — UserID because messages key off it as an immutable foreign key,
+// Username because it still carries a unique index and nothing requires it back.
 // Existing peers resolve the account to "Deleted User" client-side from the status
 // field, not from these now-blank columns.
 func (r *PostgresRepo) DeleteUser(ctx context.Context, userID uuid.UUID) error {

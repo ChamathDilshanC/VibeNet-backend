@@ -136,7 +136,7 @@ const landingHTML = `<!doctype html>
           <tr><th>Method</th><th>Endpoint</th><th>Auth</th><th>Description</th></tr>
         </thead>
         <tbody>
-          <tr><td class="method m-get">GET</td><td><code>/health</code></td><td>—</td><td>Deep health check — pings PostgreSQL &amp; DynamoDB</td></tr>
+          <tr><td class="method m-get">GET</td><td><code>/health</code></td><td>—</td><td>Deep health check — pings PostgreSQL</td></tr>
           <tr><td class="method m-post">POST</td><td><code>/api/auth/register</code></td><td>—</td><td>Register with username, password &amp; E2EE public key</td></tr>
           <tr><td class="method m-post">POST</td><td><code>/api/auth/login</code></td><td>—</td><td>Standard login — returns a signed JWT</td></tr>
           <tr><td class="method m-get">GET</td><td><code>/api/auth/google/login</code></td><td>—</td><td>Redirect to the Google OAuth consent screen</td></tr>

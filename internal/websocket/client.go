@@ -128,21 +128,21 @@ type presenceUpdateFrame struct {
 
 // Client represents a single authenticated WebSocket connection bound to a VibeNet user.
 type Client struct {
-	hub    *Hub
-	conn   *websocket.Conn
-	send   chan []byte
-	userID uuid.UUID
-	dynamo *db.DynamoRepo
+	hub      *Hub
+	conn     *websocket.Conn
+	send     chan []byte
+	userID   uuid.UUID
+	messages *db.MessageRepo
 }
 
 // NewClient constructs a Client for the authenticated user and begins read/write pumps.
-func NewClient(hub *Hub, conn *websocket.Conn, userID uuid.UUID, dynamo *db.DynamoRepo) *Client {
+func NewClient(hub *Hub, conn *websocket.Conn, userID uuid.UUID, messages *db.MessageRepo) *Client {
 	client := &Client{
-		hub:    hub,
-		conn:   conn,
-		send:   make(chan []byte, sendBufferSize),
-		userID: userID,
-		dynamo: dynamo,
+		hub:      hub,
+		conn:     conn,
+		send:     make(chan []byte, sendBufferSize),
+		userID:   userID,
+		messages: messages,
 	}
 	hub.Register(client)
 	go client.writePump()
@@ -348,7 +348,7 @@ func (c *Client) handleReadReceipt(inbound inboundMessage) {
 	c.hub.DeliverToUser(senderID, payload)
 }
 
-// groupChatRoomID derives the canonical DynamoDB room id for a group. Derived
+// groupChatRoomID derives the canonical message-room id for a group. Derived
 // server-side from the authenticated frame's group_id — never taken from the
 // client's chat_room_id — so a member can't write into another room's history.
 func groupChatRoomID(groupID uuid.UUID) string {
@@ -412,8 +412,8 @@ func (c *Client) handleGroupChatMessage(inbound inboundMessage) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		if err := c.dynamo.SaveMessage(ctx, messageID, chatRoomID, senderID, ciphertext, nonce, timestamp); err != nil {
-			log.Printf("websocket: async dynamodb save failed for group message %s: %v", messageID, err)
+		if err := c.messages.SaveMessage(ctx, messageID, chatRoomID, senderID, ciphertext, nonce, timestamp); err != nil {
+			log.Printf("websocket: async message save failed for group message %s: %v", messageID, err)
 		}
 	}(inbound.MessageID, chatRoomID, c.userID.String(), inbound.Ciphertext, inbound.Nonce, inbound.Timestamp)
 }
@@ -474,8 +474,8 @@ func (c *Client) handleChatMessage(inbound inboundMessage) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		if err := c.dynamo.SaveMessage(ctx, messageID, chatRoomID, senderID, ciphertext, nonce, timestamp); err != nil {
-			log.Printf("websocket: async dynamodb save failed for message %s: %v", messageID, err)
+		if err := c.messages.SaveMessage(ctx, messageID, chatRoomID, senderID, ciphertext, nonce, timestamp); err != nil {
+			log.Printf("websocket: async message save failed for message %s: %v", messageID, err)
 		}
 	}(inbound.MessageID, inbound.ChatRoomID, c.userID.String(), inbound.Ciphertext, inbound.Nonce, inbound.Timestamp)
 

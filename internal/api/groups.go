@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/ChamathDilshanC/VibeNet-backend/internal/db"
@@ -279,14 +278,14 @@ func (h *Handler) UploadGroupAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	avatarURL, dstPath, ok := h.storeUploadedAvatar(w, r)
+	avatarURL, objectKey, ok := h.storeUploadedAvatar(w, r, "groups/")
 	if !ok {
 		return
 	}
 
 	if err := h.postgres.UpdateGroupAvatar(r.Context(), groupID, avatarURL); err != nil {
-		// Don't leave an orphaned file behind if the DB write fails.
-		os.Remove(dstPath)
+		// Don't leave an orphaned object behind if the DB write fails.
+		h.avatarStore.Delete(r.Context(), objectKey)
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			writeError(w, http.StatusNotFound, "group not found")
 			return

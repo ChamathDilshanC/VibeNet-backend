@@ -23,15 +23,15 @@ var upgrader = websocket.Upgrader{
 type Handler struct {
 	hub        *Hub
 	apiHandler *api.Handler
-	dynamo     *db.DynamoRepo
+	messages   *db.MessageRepo
 }
 
 // NewHandler constructs a WebSocket handler with hub routing and persistence dependencies.
-func NewHandler(hub *Hub, apiHandler *api.Handler, dynamo *db.DynamoRepo) *Handler {
+func NewHandler(hub *Hub, apiHandler *api.Handler, messages *db.MessageRepo) *Handler {
 	return &Handler{
 		hub:        hub,
 		apiHandler: apiHandler,
-		dynamo:     dynamo,
+		messages:   messages,
 	}
 }
 
@@ -79,5 +79,5 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	NewClient(h.hub, conn, userID, h.dynamo)
+	NewClient(h.hub, conn, userID, h.messages)
 }
